@@ -126,11 +126,15 @@ Bật/tắt nhanh trạng thái `is_active`.
 
 - `file`: file báo cáo.
 
-**Quy tắc gộp**
+**Quy tắc gộp + enrich**
 
 - `net_affiliate_commission`: **tổng** cột `Hoa hồng ròng tiếp thị liên kết(₫)` theo từng đơn.
 - `order_status`, `sub_id1`: lấy **dòng đầu tiên** của đơn trong file (thứ tự gốc).
 - `order_placed_at`: **mốc sớm nhất** trong các dòng cùng đơn (sau khi parse datetime).
+- Enrich khi import:
+  - dùng `sub_id1` tra `convert_results.id_zl` để lấy `zl`,
+  - dùng `zl` tra `zalo_contacts` để lấy `id_from`, `name`,
+  - lưu `id_from` vào `affiliate_commission_orders.id_zl` và `name` vào `affiliate_commission_orders.name`.
 
 **Response mẫu**
 
@@ -138,7 +142,14 @@ Bật/tắt nhanh trạng thái `is_active`.
 {
   "upserted": 120,
   "unique_orders": 120,
-  "source_filename": "AffiliateCommissionReport202604231103.csv"
+  "source_filename": "AffiliateCommissionReport202604231103.csv",
+  "lookup": {
+    "sub_id1_count": 120,
+    "matched_convert_results": 115,
+    "missing_convert_results": 5,
+    "matched_zalo_contacts": 109,
+    "missing_zalo_contacts": 6
+  }
 }
 ```
 
