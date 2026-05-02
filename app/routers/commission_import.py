@@ -13,6 +13,7 @@ MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 UPSERT_CHUNK = 500
 LOOKUP_CHUNK = 500
 PLACED_WITHIN_DAYS_ALLOWED = frozenset({1, 3, 7, 14})
+ORDER_STATUS_PAID_SYNCED = "Đã cộng tiền"
 
 
 def _chunked(values: list[str], size: int) -> list[list[str]]:
@@ -263,6 +264,7 @@ async def import_commission_report(file: UploadFile = File(...)):
         return {
             "upserted": 0,
             "unique_orders": 0,
+            "skipped_already_paid": 0,
             "message": "Khong co dong hop le sau khi doc file",
         }
 
@@ -385,6 +387,40 @@ async def import_commission_report(file: UploadFile = File(...)):
             status_code=500,
             detail=f"Doc order_status hien co loi: {exc}",
         ) from exc
+
+    unique_orders_from_file = len(rows)
+    rows_to_upsert: list[dict] = []
+    for r in rows:
+        oid = str(r.get("order_id") or "").strip()
+        prev = existing_order_status.get(oid)
+        if str(prev or "").strip() == ORDER_STATUS_PAID_SYNCED:
+            continue
+        rows_to_upsert.append(r)
+    skipped_already_paid = unique_orders_from_file - len(rows_to_upsert)
+    rows = rows_to_upsert
+    logger.info(
+        "[commission-import] skip_paid_synced=%s remaining_for_upsert=%s",
+        skipped_already_paid,
+        len(rows),
+    )
+
+    if not rows:
+        return {
+            "upserted": 0,
+            "unique_orders": unique_orders_from_file,
+            "skipped_already_paid": skipped_already_paid,
+            "source_filename": file.filename,
+            "lookup": {
+                "sub_id1_count": len(sub_id_values),
+                "matched_convert_results": matched_convert,
+                "missing_convert_results": len(sub_id_values) - len(convert_info_map),
+                "matched_zalo_contacts": matched_contact,
+                "missing_zalo_contacts": max(matched_convert - matched_contact, 0),
+                "matched_commission_config": matched_config,
+                "missing_commission_config": missing_config,
+            },
+        }
+
     _apply_order_status_transition(rows, existing_order_status)
 
     upserted = 0
@@ -405,7 +441,8 @@ async def import_commission_report(file: UploadFile = File(...)):
 
     return {
         "upserted": upserted,
-        "unique_orders": len(rows),
+        "unique_orders": unique_orders_from_file,
+        "skipped_already_paid": skipped_already_paid,
         "source_filename": file.filename,
         "lookup": {
             "sub_id1_count": len(sub_id_values),
