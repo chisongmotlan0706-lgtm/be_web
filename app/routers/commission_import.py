@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 
@@ -11,10 +12,50 @@ logger = logging.getLogger(__name__)
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 UPSERT_CHUNK = 500
 LOOKUP_CHUNK = 500
+PLACED_WITHIN_DAYS_ALLOWED = frozenset({1, 3, 7, 14})
 
 
 def _chunked(values: list[str], size: int) -> list[list[str]]:
     return [values[i : i + size] for i in range(0, len(values), size)]
+
+
+def _fetch_existing_order_status_by_order_id(
+    supabase, order_ids: list[str]
+) -> dict[str, str | None]:
+    """order_id -> order_status trong DB truoc lan import nay."""
+    out: dict[str, str | None] = {}
+    unique_ids = sorted({oid.strip() for oid in order_ids if str(oid).strip()})
+    for chunk in _chunked(unique_ids, LOOKUP_CHUNK):
+        result = (
+            supabase.table("affiliate_commission_orders")
+            .select("order_id,order_status")
+            .in_("order_id", chunk)
+            .execute()
+        )
+        for item in result.data or []:
+            oid = str(item.get("order_id") or "").strip()
+            if not oid:
+                continue
+            out[oid] = str(item.get("order_status") or "").strip() or None
+    return out
+
+
+def _apply_order_status_transition(rows: list[dict], existing_status: dict[str, str | None]) -> None:
+    """
+    order_status luon lay tu file (da co trong row).
+    order_status_transition: chi khi doi trang thai (cũ -> mới); khong doi thi null.
+    """
+    for row in rows:
+        oid = str(row.get("order_id") or "").strip()
+        new_st = str(row.get("order_status") or "").strip()
+        old_st = existing_status.get(oid)
+        if old_st is None:
+            row["order_status_transition"] = None
+            continue
+        if old_st != new_st:
+            row["order_status_transition"] = f"{old_st} -> {new_st}"
+        else:
+            row["order_status_transition"] = None
 
 
 def _build_convert_info_map(supabase, sub_id_values: list[str]) -> dict[str, dict[str, str | None]]:
@@ -106,17 +147,24 @@ def _pick_payout_pct(
 @router.get("/orders")
 def list_commission_orders(
     limit: int = Query(default=200, ge=1, le=1000),
+    placed_within_days: int | None = Query(
+        default=None,
+        description="Loc theo order_placed_at: chi lay don dat trong N ngay gan day (1, 3, 7, 14). Bo qua = tat ca.",
+    ),
 ):
     """Doc ban ghi da import trong affiliate_commission_orders (moi nhat truoc)."""
+    if placed_within_days is not None and placed_within_days not in PLACED_WITHIN_DAYS_ALLOWED:
+        raise HTTPException(
+            status_code=400,
+            detail="placed_within_days chi chap nhan 1, 3, 7 hoac 14",
+        )
     try:
         supabase = get_supabase_client()
-        result = (
-            supabase.table("affiliate_commission_orders")
-            .select("*")
-            .order("order_placed_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
+        query = supabase.table("affiliate_commission_orders").select("*")
+        if placed_within_days is not None:
+            start = datetime.now(timezone.utc) - timedelta(days=placed_within_days)
+            query = query.gte("order_placed_at", start.isoformat())
+        result = query.order("order_placed_at", desc=True).limit(limit).execute()
         items = result.data or []
         return {"count": len(items), "items": items}
     except Exception as exc:
@@ -124,6 +172,56 @@ def list_commission_orders(
             status_code=500,
             detail=f"Query Supabase loi: {exc}",
         ) from exc
+
+
+def _unwrap_rpc_jsonb(result) -> dict:
+    """Chuan hoa response RPC tra ve jsonb (dict / list mot phan tu / key ten ham)."""
+    data = result.data
+    if data is None:
+        return {}
+    if isinstance(data, dict):
+        if "orders_updated" in data:
+            return data
+        if len(data) == 1:
+            inner = next(iter(data.values()))
+            if isinstance(inner, dict):
+                return inner
+        return data
+    if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
+        row = data[0]
+        if "orders_updated" in row:
+            return row
+        if len(row) == 1:
+            inner = next(iter(row.values()))
+            if isinstance(inner, dict):
+                return inner
+    return {}
+
+
+@router.post("/sync-hh-to-zalo")
+def sync_hh_to_zalo():
+    """
+    Goi RPC sync_commission_hh_to_zalo: cong HH user don Hoan thanh vao zalo_contacts.available_amount,
+    doi trang thai don sang Da cong tien (mot transaction tren Supabase).
+    """
+    try:
+        supabase = get_supabase_client()
+        result = supabase.rpc("sync_commission_hh_to_zalo", {}).execute()
+    except Exception as exc:
+        logger.exception("[commission-sync] RPC failed")
+        raise HTTPException(status_code=500, detail=f"RPC loi: {exc}") from exc
+
+    payload = _unwrap_rpc_jsonb(result)
+    if not payload:
+        raise HTTPException(status_code=500, detail="RPC tra ve rong")
+    logger.info(
+        "[commission-sync] orders_updated=%s skipped=%s contacts=%s total=%s",
+        payload.get("orders_updated"),
+        payload.get("orders_skipped_no_contact"),
+        len(payload.get("contacts") or []) if isinstance(payload.get("contacts"), list) else 0,
+        payload.get("total_amount_added"),
+    )
+    return payload
 
 
 @router.post("/import")
@@ -278,6 +376,16 @@ async def import_commission_report(file: UploadFile = File(...)):
         matched_config,
         missing_config,
     )
+
+    order_id_list = [str(r.get("order_id") or "") for r in rows]
+    try:
+        existing_order_status = _fetch_existing_order_status_by_order_id(supabase, order_id_list)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Doc order_status hien co loi: {exc}",
+        ) from exc
+    _apply_order_status_transition(rows, existing_order_status)
 
     upserted = 0
     for start in range(0, len(rows), UPSERT_CHUNK):
