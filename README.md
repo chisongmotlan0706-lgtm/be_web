@@ -103,9 +103,18 @@ Upload file báo cáo hoa hồng Shopee (`.csv`, `.xlsx`, `.xls`), **gộp theo 
 
 ### `POST /commission-report/sync-hh-to-zalo`
 
-Gọi RPC `sync_commission_hh_to_zalo` trên Supabase (**một transaction**): các đơn `order_status = 'Hoàn thành'` có `id_zl` khớp `zalo_contacts.id_from` được cộng `SUM(hh_user)` vào `zalo_contacts.available_amount`, sau đó đổi `order_status` thành **`Đã cộng tiền`**. Response gồm `orders_updated`, `orders_skipped_no_contact`, `contacts[]` (mỗi phần tử: `id_from`, `name`, `amount_added`, `order_count`, `available_amount_after`), `total_amount_added`.
+Gọi RPC `sync_commission_hh_to_zalo` trên Supabase (**một transaction**): các đơn `order_status = 'Hoàn thành'` có `id_zl` khớp `zalo_contacts.id_from` được cộng `SUM(hh_user)` vào `zalo_contacts.available_amount`, sau đó đổi `order_status` thành **`Đã cộng tiền`**, đồng thời **ghi** `public.commission_payout_sync_log` (mỗi contact một dòng: `sync_batch_id`, `id_from`, `d_name`, …). Response gồm `sync_batch_id`, `orders_updated`, `orders_skipped_no_contact`, `contacts[]`, `total_amount_added`.
 
-Cần chạy migration `003_sync_commission_hh_to_zalo.sql` và có cột `zalo_contacts.available_amount`.
+Cần chạy migration `003` (RPC lần đầu) và **`004_commission_payout_sync_log.sql`** (bảng log + thay thế RPC), có cột `zalo_contacts.available_amount`.
+
+### `GET /commission-report/payout-sync-logs?limit=500&placed_within_days=7`
+
+Đọc `public.commission_payout_sync_log`, sắp xếp `created_at` giảm dần.
+
+**Query params**
+
+- `limit` (optional): mặc định `500`, tối đa `2000`.
+- `placed_within_days` (optional): `1`, `3`, `7`, `14` — lọc `created_at` từ N ngày gần đây (UTC); bỏ qua = tất cả.
 
 ### `GET /commission-config?limit=200`
 
@@ -138,8 +147,8 @@ Bật/tắt nhanh trạng thái `is_active`.
 - `net_affiliate_commission`: **tổng** cột `Hoa hồng ròng tiếp thị liên kết(₫)` theo từng đơn.
 - `order_status`, `sub_id1`: lấy **dòng đầu tiên** của đơn trong file (thứ tự gốc).
 - `order_status_transition`: nếu đơn đã tồn tại và `order_status` trong DB **khác** trạng thái từ file thì ghi `"cũ -> mới"`; nếu **không đổi** thì `NULL` (xóa chuỗi cũ).
-- Đơn đã có trong DB với `order_status = "Đã cộng tiền"` thì **bỏ qua** (không upsert); response có `skipped_already_paid`.
-- `order_placed_at`: **mốc sớm nhất** trong các dòng cùng đơn (sau khi parse datetime).
+- Đơn đã có trong DB với `order_status = "Đã cộng tiền"`: **không upsert** toàn bộ; chỉ **UPDATE** `order_placed_at` và `source_filename` từ file (sau khi parse đúng giờ VN). Response có `paid_placed_at_refreshed`; `skipped_already_paid` luôn `0` (giữ key tương thích).
+- `order_placed_at`: **mốc sớm nhất** trong các dòng cùng đơn. Cột thời gian trong file được coi là **giờ wall Việt Nam** (`Asia/Ho_Chi_Minh`), ưu tiên định dạng **ngày/tháng** (`dayfirst=True`), dòng không parse được thì thử **tháng/ngày**; sau đó chuyển **UTC** rồi lưu `timestamptz`.
 - Enrich khi import:
   - dùng `sub_id1` tra `convert_results.id_zl` để lấy `zl`,
   - dùng `zl` tra `zalo_contacts` để lấy `id_from`, `name`,
@@ -169,6 +178,7 @@ Chạy migration SQL một lần trong Supabase SQL Editor:
 - `supabase/migrations/001_affiliate_commission_orders.sql`
 - `supabase/migrations/002_order_status_transition.sql` (cột `order_status_transition`)
 - `supabase/migrations/003_sync_commission_hh_to_zalo.sql` (RPC đồng bộ HH → `zalo_contacts`)
+- `supabase/migrations/004_commission_payout_sync_log.sql` (bảng log + RPC ghi log + `sync_batch_id`)
 
 ## 6. Cấu trúc thư mục
 
@@ -181,13 +191,14 @@ api_bot_aff/
 │  ├─ commission_report.py    # Doc file + gop theo order_id
 │  └─ routers/
 │     ├─ getorder.py          # Endpoint /getorder
-│     ├─ commission_import.py # GET /commission-report/orders, POST import + sync-hh-to-zalo
+│     ├─ commission_import.py # GET orders + payout-sync-logs, POST import + sync-hh-to-zalo
 │     └─ commission_config.py # CRUD commission_config
 ├─ supabase/
 │  └─ migrations/
 │     ├─ 001_affiliate_commission_orders.sql
 │     ├─ 002_order_status_transition.sql
-│     └─ 003_sync_commission_hh_to_zalo.sql
+│     ├─ 003_sync_commission_hh_to_zalo.sql
+│     └─ 004_commission_payout_sync_log.sql
 ├─ requirements.txt
 └─ README.md
 ```
