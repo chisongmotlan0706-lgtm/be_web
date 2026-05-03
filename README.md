@@ -148,7 +148,7 @@ Bật/tắt nhanh trạng thái `is_active`.
 - `order_status`, `sub_id1`: lấy **dòng đầu tiên** của đơn trong file (thứ tự gốc).
 - `order_status_transition`: nếu đơn đã tồn tại và `order_status` trong DB **khác** trạng thái từ file thì ghi `"cũ -> mới"`; nếu **không đổi** thì `NULL` (xóa chuỗi cũ).
 - Đơn đã có trong DB với `order_status = "Đã cộng tiền"`: **không upsert** toàn bộ; chỉ **UPDATE** `order_placed_at` và `source_filename` từ file (sau khi parse đúng giờ VN). Response có `paid_placed_at_refreshed`; `skipped_already_paid` luôn `0` (giữ key tương thích).
-- `order_placed_at`: **mốc sớm nhất** trong các dòng cùng đơn. Cột thời gian trong file được coi là **giờ wall Việt Nam** (`Asia/Ho_Chi_Minh`), ưu tiên định dạng **ngày/tháng** (`dayfirst=True`), dòng không parse được thì thử **tháng/ngày**; sau đó chuyển **UTC** rồi lưu `timestamptz`.
+- `order_placed_at`: **mốc sớm nhất** trong các dòng cùng đơn. Cột thời gian trong file Shopee là **M/D/YYYY** (tháng trước, ngày sau), giờ 24h, coi là **giờ wall Việt Nam** (`Asia/Ho_Chi_Minh`); parse ưu tiên `dayfirst=False`, dòng không parse được thì thử `dayfirst=True`; sau đó chuyển **UTC** rồi lưu `timestamptz`.
 - Enrich khi import:
   - dùng `sub_id1` tra `convert_results.id_zl` để lấy `zl`,
   - dùng `zl` tra `zalo_contacts` để lấy `id_from`, `name`,
@@ -179,6 +179,7 @@ Chạy migration SQL một lần trong Supabase SQL Editor:
 - `supabase/migrations/002_order_status_transition.sql` (cột `order_status_transition`)
 - `supabase/migrations/003_sync_commission_hh_to_zalo.sql` (RPC đồng bộ HH → `zalo_contacts`)
 - `supabase/migrations/004_commission_payout_sync_log.sql` (bảng log + RPC ghi log + `sync_batch_id`)
+- `supabase/migrations/005_commission_payout_sync_log_rls_fix.sql` (nếu lỗi RLS khi gọi RPC — `SECURITY DEFINER` + tắt RLS bảng log)
 
 ## 6. Cấu trúc thư mục
 
@@ -198,7 +199,8 @@ api_bot_aff/
 │     ├─ 001_affiliate_commission_orders.sql
 │     ├─ 002_order_status_transition.sql
 │     ├─ 003_sync_commission_hh_to_zalo.sql
-│     └─ 004_commission_payout_sync_log.sql
+│     ├─ 004_commission_payout_sync_log.sql
+│     └─ 005_commission_payout_sync_log_rls_fix.sql
 ├─ requirements.txt
 └─ README.md
 ```

@@ -111,3 +111,10 @@ comment on function public.sync_commission_hh_to_zalo() is
 
 grant select, insert on public.commission_payout_sync_log to service_role;
 grant select, insert on public.commission_payout_sync_log to authenticated;
+
+-- Tranh loi RLS khi Supabase bat RLS mac dinh cho bang moi.
+alter function public.sync_commission_hh_to_zalo()
+  security definer
+  set search_path = public;
+
+alter table public.commission_payout_sync_log disable row level security;

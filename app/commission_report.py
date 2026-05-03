@@ -92,15 +92,15 @@ _VN_TZ = "Asia/Ho_Chi_Minh"
 
 def _parse_order_placed_at_vn_to_utc(raw: pd.Series) -> pd.Series:
     """
-    Thoi gian dat hang trong file Shopee la wall clock Viet Nam (khong kem offset).
-    Uu tien dayfirst=True (DD/MM); dong con NaT thu dayfirst=False. Localize VN -> UTC.
+    Thoi gian dat hang trong file Shopee: dinh dang M/D/YYYY (thang/ngay), gio 24h, wall clock VN (khong offset).
+    Uu tien dayfirst=False (MM/DD/YYYY); dong con NaT thu dayfirst=True (DD/MM fallback). Localize VN -> UTC.
     """
-    s = pd.to_datetime(raw, errors="coerce", dayfirst=True, utc=False)
+    s = pd.to_datetime(raw, errors="coerce", dayfirst=False, utc=False)
     if s.isna().any():
         missing = s.isna()
         s = s.copy()
         s.loc[missing] = pd.to_datetime(
-            raw.loc[missing], errors="coerce", dayfirst=False, utc=False
+            raw.loc[missing], errors="coerce", dayfirst=True, utc=False
         )
 
     tz = getattr(s.dtype, "tz", None)
