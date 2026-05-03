@@ -1,5 +1,6 @@
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 
@@ -14,6 +15,21 @@ UPSERT_CHUNK = 500
 LOOKUP_CHUNK = 500
 PLACED_WITHIN_DAYS_ALLOWED = frozenset({1, 3, 7, 14})
 ORDER_STATUS_PAID_SYNCED = "Đã cộng tiền"
+_VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+
+def _placed_within_vn_calendar_to_now(days: int) -> tuple[datetime, datetime]:
+    """
+    Khoang [start, end] theo UTC:
+    - start: 00:00 VN tai ngay (hom_nay_theo_lich_VN - days)
+    - end: thoi diem hien tai UTC (gom ca phan hom nay da troi qua).
+    """
+    now_utc = datetime.now(timezone.utc)
+    today_vn = now_utc.astimezone(_VN_TZ).date()
+    start_date_vn = today_vn - timedelta(days=days)
+    start_local = datetime.combine(start_date_vn, time.min, tzinfo=_VN_TZ)
+    start_utc = start_local.astimezone(timezone.utc)
+    return start_utc, now_utc
 
 
 def _chunked(values: list[str], size: int) -> list[list[str]]:
@@ -150,7 +166,9 @@ def list_commission_orders(
     limit: int = Query(default=200, ge=1, le=1000),
     placed_within_days: int | None = Query(
         default=None,
-        description="Loc theo order_placed_at: chi lay don dat trong N ngay gan day (1, 3, 7, 14). Bo qua = tat ca.",
+        description=(
+            "Loc order_placed_at: tu 00:00 VN cua (hom_nay_lich_VN - N) den hien tai (1, 3, 7, 14). Bo qua = tat ca."
+        ),
     ),
 ):
     """Doc ban ghi da import trong affiliate_commission_orders (moi nhat truoc)."""
@@ -163,8 +181,10 @@ def list_commission_orders(
         supabase = get_supabase_client()
         query = supabase.table("affiliate_commission_orders").select("*")
         if placed_within_days is not None:
-            start = datetime.now(timezone.utc) - timedelta(days=placed_within_days)
-            query = query.gte("order_placed_at", start.isoformat())
+            start_utc, end_utc = _placed_within_vn_calendar_to_now(placed_within_days)
+            query = query.gte("order_placed_at", start_utc.isoformat()).lte(
+                "order_placed_at", end_utc.isoformat()
+            )
         result = query.order("order_placed_at", desc=True).limit(limit).execute()
         items = result.data or []
         return {"count": len(items), "items": items}
@@ -180,7 +200,9 @@ def list_payout_sync_logs(
     limit: int = Query(default=500, ge=1, le=2000),
     placed_within_days: int | None = Query(
         default=None,
-        description="Loc theo created_at: chi lay ban ghi trong N ngay gan day (1, 3, 7, 14). Bo qua = tat ca.",
+        description=(
+            "Loc created_at: tu 00:00 VN cua (hom_nay_lich_VN - N) den hien tai (1, 3, 7, 14). Bo qua = tat ca."
+        ),
     ),
 ):
     """Doc lich su dong bo tien (commission_payout_sync_log), moi nhat truoc."""
@@ -193,8 +215,10 @@ def list_payout_sync_logs(
         supabase = get_supabase_client()
         query = supabase.table("commission_payout_sync_log").select("*")
         if placed_within_days is not None:
-            start = datetime.now(timezone.utc) - timedelta(days=placed_within_days)
-            query = query.gte("created_at", start.isoformat())
+            start_utc, end_utc = _placed_within_vn_calendar_to_now(placed_within_days)
+            query = query.gte("created_at", start_utc.isoformat()).lte(
+                "created_at", end_utc.isoformat()
+            )
         result = query.order("created_at", desc=True).limit(limit).execute()
         items = result.data or []
         return {"count": len(items), "items": items}
