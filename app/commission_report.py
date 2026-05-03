@@ -87,6 +87,32 @@ def _first_nonempty(values: pd.Series) -> str | None:
     return None
 
 
+_VN_TZ = "Asia/Ho_Chi_Minh"
+
+
+def _parse_order_placed_at_vn_to_utc(raw: pd.Series) -> pd.Series:
+    """
+    Thoi gian dat hang trong file Shopee la wall clock Viet Nam (khong kem offset).
+    Uu tien dayfirst=True (DD/MM); dong con NaT thu dayfirst=False. Localize VN -> UTC.
+    """
+    s = pd.to_datetime(raw, errors="coerce", dayfirst=True, utc=False)
+    if s.isna().any():
+        missing = s.isna()
+        s = s.copy()
+        s.loc[missing] = pd.to_datetime(
+            raw.loc[missing], errors="coerce", dayfirst=False, utc=False
+        )
+
+    tz = getattr(s.dtype, "tz", None)
+    if tz is None:
+        s = s.dt.tz_localize(
+            _VN_TZ,
+            ambiguous="infer",
+            nonexistent="shift_forward",
+        )
+    return s.dt.tz_convert("UTC")
+
+
 def aggregate_commission_rows(df: pd.DataFrame) -> list[dict[str, Any]]:
     columns = resolve_commission_columns(list(df.columns))
 
@@ -109,20 +135,7 @@ def aggregate_commission_rows(df: pd.DataFrame) -> list[dict[str, Any]]:
     if work.empty:
         return []
 
-    work["order_placed_at"] = pd.to_datetime(
-        work["order_placed_at_raw"],
-        errors="coerce",
-        dayfirst=False,
-        utc=True,
-    )
-
-    if work["order_placed_at"].isna().all():
-        work["order_placed_at"] = pd.to_datetime(
-            work["order_placed_at_raw"],
-            errors="coerce",
-            dayfirst=True,
-            utc=True,
-        )
+    work["order_placed_at"] = _parse_order_placed_at_vn_to_utc(work["order_placed_at_raw"])
 
     if work["net_commission"].isna().any():
         bad = int(work["net_commission"].isna().sum())

@@ -175,6 +175,36 @@ def list_commission_orders(
         ) from exc
 
 
+@router.get("/payout-sync-logs")
+def list_payout_sync_logs(
+    limit: int = Query(default=500, ge=1, le=2000),
+    placed_within_days: int | None = Query(
+        default=None,
+        description="Loc theo created_at: chi lay ban ghi trong N ngay gan day (1, 3, 7, 14). Bo qua = tat ca.",
+    ),
+):
+    """Doc lich su dong bo tien (commission_payout_sync_log), moi nhat truoc."""
+    if placed_within_days is not None and placed_within_days not in PLACED_WITHIN_DAYS_ALLOWED:
+        raise HTTPException(
+            status_code=400,
+            detail="placed_within_days chi chap nhan 1, 3, 7 hoac 14",
+        )
+    try:
+        supabase = get_supabase_client()
+        query = supabase.table("commission_payout_sync_log").select("*")
+        if placed_within_days is not None:
+            start = datetime.now(timezone.utc) - timedelta(days=placed_within_days)
+            query = query.gte("created_at", start.isoformat())
+        result = query.order("created_at", desc=True).limit(limit).execute()
+        items = result.data or []
+        return {"count": len(items), "items": items}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query payout sync log loi: {exc}",
+        ) from exc
+
+
 def _unwrap_rpc_jsonb(result) -> dict:
     """Chuan hoa response RPC tra ve jsonb (dict / list mot phan tu / key ten ham)."""
     data = result.data
@@ -265,6 +295,7 @@ async def import_commission_report(file: UploadFile = File(...)):
             "upserted": 0,
             "unique_orders": 0,
             "skipped_already_paid": 0,
+            "paid_placed_at_refreshed": 0,
             "message": "Khong co dong hop le sau khi doc file",
         }
 
@@ -389,18 +420,43 @@ async def import_commission_report(file: UploadFile = File(...)):
         ) from exc
 
     unique_orders_from_file = len(rows)
+    rows_paid_ts: list[dict] = []
     rows_to_upsert: list[dict] = []
     for r in rows:
         oid = str(r.get("order_id") or "").strip()
         prev = existing_order_status.get(oid)
         if str(prev or "").strip() == ORDER_STATUS_PAID_SYNCED:
+            rows_paid_ts.append(r)
+        else:
+            rows_to_upsert.append(r)
+
+    paid_placed_at_refreshed = 0
+    for pr in rows_paid_ts:
+        oid = str(pr.get("order_id") or "").strip()
+        if not oid:
             continue
-        rows_to_upsert.append(r)
-    skipped_already_paid = unique_orders_from_file - len(rows_to_upsert)
+        try:
+            supabase.table("affiliate_commission_orders").update(
+                {
+                    "order_placed_at": pr["order_placed_at"],
+                    "source_filename": pr.get("source_filename"),
+                }
+            ).eq("order_id", oid).execute()
+            paid_placed_at_refreshed += 1
+        except Exception as exc:
+            logger.exception(
+                "[commission-import] paid order placed_at refresh failed order_id=%s",
+                oid,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Cap nhat thoi gian dat don Da cong tien loi: {exc}",
+            ) from exc
+
     rows = rows_to_upsert
     logger.info(
-        "[commission-import] skip_paid_synced=%s remaining_for_upsert=%s",
-        skipped_already_paid,
+        "[commission-import] paid_placed_at_refreshed=%s remaining_for_upsert=%s",
+        paid_placed_at_refreshed,
         len(rows),
     )
 
@@ -408,7 +464,8 @@ async def import_commission_report(file: UploadFile = File(...)):
         return {
             "upserted": 0,
             "unique_orders": unique_orders_from_file,
-            "skipped_already_paid": skipped_already_paid,
+            "skipped_already_paid": 0,
+            "paid_placed_at_refreshed": paid_placed_at_refreshed,
             "source_filename": file.filename,
             "lookup": {
                 "sub_id1_count": len(sub_id_values),
@@ -442,7 +499,8 @@ async def import_commission_report(file: UploadFile = File(...)):
     return {
         "upserted": upserted,
         "unique_orders": unique_orders_from_file,
-        "skipped_already_paid": skipped_already_paid,
+        "skipped_already_paid": 0,
+        "paid_placed_at_refreshed": paid_placed_at_refreshed,
         "source_filename": file.filename,
         "lookup": {
             "sub_id1_count": len(sub_id_values),
