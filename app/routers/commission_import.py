@@ -1,4 +1,5 @@
 import logging
+import uuid
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -16,6 +17,13 @@ LOOKUP_CHUNK = 500
 PLACED_WITHIN_DAYS_ALLOWED = frozenset({1, 3, 7, 14})
 ORDER_STATUS_PAID_SYNCED = "Đã cộng tiền"
 _VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+SPLIT_TABLE = "affiliate_commission_order_splits"
+SPLIT_ROLE_AGENCY = "agency"
+SPLIT_ROLE_PLATFORM_OWNER = "platform_owner"
+SPLIT_AGENCY_PCT = 15
+SPLIT_OWNER_PCT = 25
+PLATFORM_OWNER_ID_ZL = "4966296585261635590"
 
 
 def _placed_within_vn_calendar_to_now(days: int) -> tuple[datetime, datetime]:
@@ -161,6 +169,196 @@ def _pick_payout_pct(
     return None
 
 
+def _is_order_status_cancelled(order_status: str | None) -> bool:
+    t = (order_status or "").strip().lower()
+    return "hủy" in t or "huỷ" in t
+
+
+def _fetch_agency_id_zl_from_zalo_groups(supabase, group_id: str) -> str | None:
+    gid = str(group_id or "").strip()
+    if not gid:
+        return None
+    result = (
+        supabase.table("zalo_groups")
+        .select("id_zl")
+        .eq("group_id", gid)
+        .is_("deleted_at", "null")
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        return None
+    zl = str(rows[0].get("id_zl") or "").strip()
+    return zl or None
+
+
+def _fetch_commission_orders_rows_by_order_ids(
+    supabase, order_ids: list[str]
+) -> list[dict]:
+    out: list[dict] = []
+    unique_ids = sorted({oid.strip() for oid in order_ids if str(oid).strip()})
+    for chunk in _chunked(unique_ids, LOOKUP_CHUNK):
+        result = (
+            supabase.table("affiliate_commission_orders")
+            .select("id,order_id,order_status,net_affiliate_commission,sub_id1,source_filename")
+            .in_("order_id", chunk)
+            .execute()
+        )
+        for item in result.data or []:
+            out.append(item)
+    return out
+
+
+def _sync_commission_order_splits_for_import(
+    supabase,
+    orders_from_db: list[dict],
+    import_batch_id: str,
+    convert_info_map: dict[str, dict[str, str | None]],
+) -> dict[str, int]:
+    """
+    Dong bo affiliate_commission_order_splits sau khi upsert don chinh.
+    Don Da huy: chi cap nhat order_status tren splits, giu amount.
+    Don Da cong tien: khong goi ham nay.
+    """
+    stats = {
+        "splits_rows_upserted": 0,
+        "orders_splits_status_only": 0,
+        "splits_rows_deleted": 0,
+    }
+    for order in orders_from_db:
+        cid_raw = order.get("id")
+        oid = str(order.get("order_id") or "").strip()
+        if not cid_raw or not oid:
+            continue
+        cid = str(cid_raw)
+        order_status = str(order.get("order_status") or "").strip()
+        net = float(order.get("net_affiliate_commission") or 0)
+        sub_id1 = str(order.get("sub_id1") or "").strip() or None
+        source_filename = order.get("source_filename")
+
+        if _is_order_status_cancelled(order_status):
+            try:
+                supabase.table(SPLIT_TABLE).update(
+                    {
+                        "order_status": order_status,
+                        "import_batch_id": import_batch_id,
+                    }
+                ).eq("commission_order_id", cid).execute()
+            except Exception as exc:
+                logger.exception(
+                    "[commission-import] splits cancel status update failed order_id=%s",
+                    oid,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Cap nhat splits (Da huy) loi: {exc}",
+                ) from exc
+            stats["orders_splits_status_only"] += 1
+            continue
+
+        if not sub_id1:
+            try:
+                del_res = (
+                    supabase.table(SPLIT_TABLE).delete().eq("commission_order_id", cid).execute()
+                )
+                n = len(del_res.data or []) if del_res.data is not None else 0
+                stats["splits_rows_deleted"] += n
+            except Exception as exc:
+                logger.exception(
+                    "[commission-import] splits delete (missing sub_id1) failed order_id=%s",
+                    oid,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Xoa splits loi: {exc}",
+                ) from exc
+            continue
+
+        convert_info = convert_info_map.get(sub_id1)
+        group_id_res: str | None = None
+        agency_id_zl: str | None = None
+        if convert_info:
+            group_id_res = convert_info.get("group_id")
+            if group_id_res:
+                gid = str(group_id_res).strip() or None
+                group_id_res = gid
+                if gid:
+                    agency_id_zl = _fetch_agency_id_zl_from_zalo_groups(supabase, gid)
+
+        owner_amount = round((net * SPLIT_OWNER_PCT) / 100.0, 4)
+        agency_amount = round((net * SPLIT_AGENCY_PCT) / 100.0, 4)
+
+        split_rows: list[dict] = []
+        if agency_id_zl:
+            split_rows.append(
+                {
+                    "commission_order_id": cid,
+                    "order_id": oid,
+                    "split_role": SPLIT_ROLE_AGENCY,
+                    "id_zl": agency_id_zl,
+                    "group_id": group_id_res,
+                    "payout_pct": SPLIT_AGENCY_PCT,
+                    "amount": agency_amount,
+                    "net_affiliate_commission_at_split": net,
+                    "order_status": order_status,
+                    "import_batch_id": import_batch_id,
+                    "source_filename": source_filename,
+                }
+            )
+        split_rows.append(
+            {
+                "commission_order_id": cid,
+                "order_id": oid,
+                "split_role": SPLIT_ROLE_PLATFORM_OWNER,
+                "id_zl": PLATFORM_OWNER_ID_ZL,
+                "group_id": group_id_res,
+                "payout_pct": SPLIT_OWNER_PCT,
+                "amount": owner_amount,
+                "net_affiliate_commission_at_split": net,
+                "order_status": order_status,
+                "import_batch_id": import_batch_id,
+                "source_filename": source_filename,
+            }
+        )
+
+        try:
+            supabase.table(SPLIT_TABLE).upsert(
+                split_rows,
+                on_conflict="commission_order_id,split_role",
+            ).execute()
+            stats["splits_rows_upserted"] += len(split_rows)
+        except Exception as exc:
+            logger.exception("[commission-import] splits upsert failed order_id=%s", oid)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Luu splits loi: {exc}",
+            ) from exc
+
+        if not agency_id_zl:
+            try:
+                del_res = (
+                    supabase.table(SPLIT_TABLE)
+                    .delete()
+                    .eq("commission_order_id", cid)
+                    .eq("split_role", SPLIT_ROLE_AGENCY)
+                    .execute()
+                )
+                n = len(del_res.data or []) if del_res.data is not None else 0
+                stats["splits_rows_deleted"] += n
+            except Exception as exc:
+                logger.exception(
+                    "[commission-import] splits delete orphan agency failed order_id=%s",
+                    oid,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Xoa split agency loi: {exc}",
+                ) from exc
+
+    return stats
+
+
 @router.get("/orders")
 def list_commission_orders(
     limit: int = Query(default=200, ge=1, le=1000),
@@ -226,6 +424,56 @@ def list_payout_sync_logs(
         raise HTTPException(
             status_code=500,
             detail=f"Query payout sync log loi: {exc}",
+        ) from exc
+
+
+@router.get("/order-splits")
+def list_commission_order_splits(
+    limit: int = Query(default=500, ge=1, le=2000),
+    placed_within_days: int | None = Query(
+        default=None,
+        description=(
+            "Loc created_at: tu 00:00 VN cua (hom_nay_lich_VN - N) den hien tai (1, 3, 7, 14). Bo qua = tat ca."
+        ),
+    ),
+):
+    """Doc affiliate_commission_order_splits (phan tang), moi nhat truoc."""
+    if placed_within_days is not None and placed_within_days not in PLACED_WITHIN_DAYS_ALLOWED:
+        raise HTTPException(
+            status_code=400,
+            detail="placed_within_days chi chap nhan 1, 3, 7 hoac 14",
+        )
+    try:
+        supabase = get_supabase_client()
+        query = supabase.table(SPLIT_TABLE).select("*")
+        if placed_within_days is not None:
+            start_utc, end_utc = _placed_within_vn_calendar_to_now(placed_within_days)
+            query = query.gte("created_at", start_utc.isoformat()).lte(
+                "created_at", end_utc.isoformat()
+            )
+        result = query.order("created_at", desc=True).limit(limit).execute()
+        items = result.data or []
+        id_zl_values = sorted(
+            {
+                str(row.get("id_zl") or "").strip()
+                for row in items
+                if str(row.get("id_zl") or "").strip()
+            }
+        )
+        if id_zl_values:
+            contact_map = _build_contact_map(supabase, id_zl_values)
+            for row in items:
+                zl = str(row.get("id_zl") or "").strip()
+                info = contact_map.get(zl) if zl else None
+                row["d_name"] = (info or {}).get("name")
+        else:
+            for row in items:
+                row["d_name"] = None
+        return {"count": len(items), "items": items}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query order splits loi: {exc}",
         ) from exc
 
 
@@ -320,6 +568,12 @@ async def import_commission_report(file: UploadFile = File(...)):
             "unique_orders": 0,
             "skipped_already_paid": 0,
             "paid_placed_at_refreshed": 0,
+            "import_batch_id": None,
+            "split_sync": {
+                "splits_rows_upserted": 0,
+                "orders_splits_status_only": 0,
+                "splits_rows_deleted": 0,
+            },
             "message": "Khong co dong hop le sau khi doc file",
         }
 
@@ -491,6 +745,12 @@ async def import_commission_report(file: UploadFile = File(...)):
             "skipped_already_paid": 0,
             "paid_placed_at_refreshed": paid_placed_at_refreshed,
             "source_filename": file.filename,
+            "import_batch_id": None,
+            "split_sync": {
+                "splits_rows_upserted": 0,
+                "orders_splits_status_only": 0,
+                "splits_rows_deleted": 0,
+            },
             "lookup": {
                 "sub_id1_count": len(sub_id_values),
                 "matched_convert_results": matched_convert,
@@ -504,6 +764,7 @@ async def import_commission_report(file: UploadFile = File(...)):
 
     _apply_order_status_transition(rows, existing_order_status)
 
+    import_batch_id = str(uuid.uuid4())
     upserted = 0
     for start in range(0, len(rows), UPSERT_CHUNK):
         chunk = rows[start : start + UPSERT_CHUNK]
@@ -520,12 +781,47 @@ async def import_commission_report(file: UploadFile = File(...)):
         upserted += len(chunk)
     logger.info("[commission-import] upsert done upserted=%s", upserted)
 
+    split_stats = {
+        "splits_rows_upserted": 0,
+        "orders_splits_status_only": 0,
+        "splits_rows_deleted": 0,
+    }
+    order_ids_for_splits = sorted(
+        {str(r.get("order_id") or "").strip() for r in rows if str(r.get("order_id") or "").strip()}
+    )
+    if order_ids_for_splits:
+        try:
+            orders_from_db = _fetch_commission_orders_rows_by_order_ids(
+                supabase, order_ids_for_splits
+            )
+            split_stats = _sync_commission_order_splits_for_import(
+                supabase,
+                orders_from_db,
+                import_batch_id,
+                convert_info_map,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("[commission-import] splits sync failed")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Dong bo splits loi: {exc}",
+            ) from exc
+        logger.info(
+            "[commission-import] splits done import_batch_id=%s stats=%s",
+            import_batch_id,
+            split_stats,
+        )
+
     return {
         "upserted": upserted,
         "unique_orders": unique_orders_from_file,
         "skipped_already_paid": 0,
         "paid_placed_at_refreshed": paid_placed_at_refreshed,
         "source_filename": file.filename,
+        "import_batch_id": import_batch_id,
+        "split_sync": split_stats,
         "lookup": {
             "sub_id1_count": len(sub_id_values),
             "matched_convert_results": matched_convert,
