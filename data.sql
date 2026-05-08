@@ -89,5 +89,6 @@ CREATE TABLE public.zalo_groups (
   created_at timestamp with time zone NOT NULL DEFAULT now(),
   updated_at timestamp with time zone NOT NULL DEFAULT now(),
   deleted_at timestamp with time zone,
+  status text,
   CONSTRAINT zalo_groups_pkey PRIMARY KEY (id)
 );

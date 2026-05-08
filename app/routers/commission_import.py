@@ -23,7 +23,6 @@ SPLIT_ROLE_AGENCY = "agency"
 SPLIT_ROLE_PLATFORM_OWNER = "platform_owner"
 SPLIT_AGENCY_PCT = 15
 SPLIT_OWNER_PCT = 25
-PLATFORM_OWNER_ID_ZL = "4966296585261635590"
 
 
 def _placed_within_vn_calendar_to_now(days: int) -> tuple[datetime, datetime]:
@@ -174,13 +173,15 @@ def _is_order_status_cancelled(order_status: str | None) -> bool:
     return "hủy" in t or "huỷ" in t
 
 
-def _fetch_agency_id_zl_from_zalo_groups(supabase, group_id: str) -> str | None:
+def _fetch_group_owner_and_agency_id_zl(
+    supabase, group_id: str
+) -> tuple[str | None, str | None]:
     gid = str(group_id or "").strip()
     if not gid:
-        return None
+        return None, None
     result = (
         supabase.table("zalo_groups")
-        .select("id_zl")
+        .select("id_zl,id_zl_main")
         .eq("group_id", gid)
         .is_("deleted_at", "null")
         .limit(1)
@@ -188,9 +189,10 @@ def _fetch_agency_id_zl_from_zalo_groups(supabase, group_id: str) -> str | None:
     )
     rows = result.data or []
     if not rows:
-        return None
-    zl = str(rows[0].get("id_zl") or "").strip()
-    return zl or None
+        return None, None
+    agency_id_zl = str(rows[0].get("id_zl") or "").strip() or None
+    owner_id_zl_main = str(rows[0].get("id_zl_main") or "").strip() or None
+    return agency_id_zl, owner_id_zl_main
 
 
 def _fetch_commission_orders_rows_by_order_ids(
@@ -208,6 +210,56 @@ def _fetch_commission_orders_rows_by_order_ids(
         for item in result.data or []:
             out.append(item)
     return out
+
+
+def _fetch_orders_map_by_order_id(supabase, order_ids: list[str]) -> dict[str, dict]:
+    """order_id -> ban ghi day du (select *) de so sanh truoc khi upsert."""
+    out: dict[str, dict] = {}
+    unique_ids = sorted({oid.strip() for oid in order_ids if str(oid).strip()})
+    for chunk in _chunked(unique_ids, LOOKUP_CHUNK):
+        result = (
+            supabase.table("affiliate_commission_orders")
+            .select("*")
+            .in_("order_id", chunk)
+            .execute()
+        )
+        for item in result.data or []:
+            oid = str(item.get("order_id") or "").strip()
+            if oid:
+                out[oid] = item
+    return out
+
+
+def _incoming_commission_row_equals_db(incoming: dict, db: dict) -> bool:
+    """
+    True neu order_status tu file trung voi DB -> khong co "thay doi trang thai" -> bo qua upsert.
+    Net/thoi gian/sub_id1/hh_user/... khong tinh la thay doi (chi can status khac moi upsert).
+    Chi goi khi da co ban ghi DB (don moi khong goi).
+    """
+    return str(incoming.get("order_status") or "").strip() == str(db.get("order_status") or "").strip()
+
+
+def _partition_rows_skip_unchanged(supabase, rows: list[dict]) -> tuple[list[dict], int]:
+    """
+    Bo qua upsert neu order_status file == DB (khong doi trang thai).
+    Tra ve (rows_se_upsert, so_dong_bo_qua).
+    """
+    if not rows:
+        return [], 0
+    order_ids = [
+        str(r.get("order_id") or "").strip() for r in rows if str(r.get("order_id") or "").strip()
+    ]
+    existing = _fetch_orders_map_by_order_id(supabase, order_ids)
+    out: list[dict] = []
+    skipped = 0
+    for r in rows:
+        oid = str(r.get("order_id") or "").strip()
+        db_row = existing.get(oid)
+        if db_row is not None and _incoming_commission_row_equals_db(r, db_row):
+            skipped += 1
+            continue
+        out.append(r)
+    return out, skipped
 
 
 def _sync_commission_order_splits_for_import(
@@ -243,6 +295,8 @@ def _sync_commission_order_splits_for_import(
                     {
                         "order_status": order_status,
                         "import_batch_id": import_batch_id,
+                        "amount": 0,
+                        "net_affiliate_commission_at_split": 0,
                     }
                 ).eq("commission_order_id", cid).execute()
             except Exception as exc:
@@ -278,13 +332,27 @@ def _sync_commission_order_splits_for_import(
         convert_info = convert_info_map.get(sub_id1)
         group_id_res: str | None = None
         agency_id_zl: str | None = None
+        owner_id_zl_main: str | None = None
         if convert_info:
             group_id_res = convert_info.get("group_id")
             if group_id_res:
                 gid = str(group_id_res).strip() or None
                 group_id_res = gid
                 if gid:
-                    agency_id_zl = _fetch_agency_id_zl_from_zalo_groups(supabase, gid)
+                    agency_id_zl, owner_id_zl_main = _fetch_group_owner_and_agency_id_zl(
+                        supabase, gid
+                    )
+
+        if not group_id_res:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Khong tim thay group_id cho order_id={oid} (sub_id1={sub_id1})",
+            )
+        if not owner_id_zl_main:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Khong tim thay id_zl_main trong zalo_groups cho group_id={group_id_res} (order_id={oid})",
+            )
 
         owner_amount = round((net * SPLIT_OWNER_PCT) / 100.0, 4)
         agency_amount = round((net * SPLIT_AGENCY_PCT) / 100.0, 4)
@@ -311,7 +379,7 @@ def _sync_commission_order_splits_for_import(
                 "commission_order_id": cid,
                 "order_id": oid,
                 "split_role": SPLIT_ROLE_PLATFORM_OWNER,
-                "id_zl": PLATFORM_OWNER_ID_ZL,
+                "id_zl": owner_id_zl_main,
                 "group_id": group_id_res,
                 "payout_pct": SPLIT_OWNER_PCT,
                 "amount": owner_amount,
@@ -430,6 +498,10 @@ def list_payout_sync_logs(
 @router.get("/order-splits")
 def list_commission_order_splits(
     limit: int = Query(default=500, ge=1, le=2000),
+    order_id: str | None = Query(
+        default=None,
+        description="Loc theo order_id (exact). Bo qua = tat ca.",
+    ),
     placed_within_days: int | None = Query(
         default=None,
         description=(
@@ -446,6 +518,8 @@ def list_commission_order_splits(
     try:
         supabase = get_supabase_client()
         query = supabase.table(SPLIT_TABLE).select("*")
+        if order_id is not None and str(order_id).strip():
+            query = query.eq("order_id", str(order_id).strip())
         if placed_within_days is not None:
             start_utc, end_utc = _placed_within_vn_calendar_to_now(placed_within_days)
             query = query.gte("created_at", start_utc.isoformat()).lte(
@@ -501,6 +575,206 @@ def _unwrap_rpc_jsonb(result) -> dict:
     return {}
 
 
+def _analyze_import_rows(content: bytes, filename: str) -> dict:
+    try:
+        rows = parse_and_aggregate_report(content, filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Doc file loi: {exc}") from exc
+
+    if not rows:
+        return {
+            "rows_to_upsert": [],
+            "skipped_already_paid": 0,
+            "unique_orders_from_file": 0,
+            "sub_id_values": [],
+            "convert_info_map": {},
+            "matched_convert": 0,
+            "matched_contact": 0,
+            "matched_config": 0,
+            "missing_config": 0,
+        }
+
+    supabase = get_supabase_client()
+    for row in rows:
+        row["source_filename"] = filename
+        row["id_zl"] = None
+        row["name"] = None
+        row["hh_user"] = 0
+
+    sub_id_values = sorted(
+        {
+            str(row.get("sub_id1") or "").strip()
+            for row in rows
+            if str(row.get("sub_id1") or "").strip()
+        }
+    )
+
+    try:
+        convert_info_map = _build_convert_info_map(supabase, sub_id_values)
+        zl_values = sorted(
+            {
+                str(info.get("zl") or "").strip()
+                for info in convert_info_map.values()
+                if str(info.get("zl") or "").strip()
+            }
+        )
+        contact_map = _build_contact_map(supabase, zl_values)
+        config_rows = _build_commission_config_rows(supabase)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Tra cuu convert_results/zalo_contacts loi: {exc}",
+        ) from exc
+
+    matched_convert = 0
+    matched_contact = 0
+    matched_config = 0
+    missing_config = 0
+    for row in rows:
+        sub_id1 = str(row.get("sub_id1") or "").strip()
+        if not sub_id1:
+            continue
+        convert_info = convert_info_map.get(sub_id1)
+        if not convert_info:
+            continue
+        matched_convert += 1
+        zl = str(convert_info.get("zl") or "").strip()
+        group_id = str(convert_info.get("group_id") or "").strip() or None
+        contact = contact_map.get(zl)
+        if not contact:
+            continue
+
+        payout_pct = _pick_payout_pct(config_rows, group_id=group_id, id_from=zl)
+        if payout_pct is None:
+            missing_config += 1
+            payout_pct = 0
+        else:
+            matched_config += 1
+
+        net_commission = float(row.get("net_affiliate_commission") or 0)
+        row["id_zl"] = zl
+        row["name"] = contact.get("name")
+        row["hh_user"] = round((net_commission * payout_pct) / 100, 4)
+        matched_contact += 1
+
+    order_id_list = [str(r.get("order_id") or "") for r in rows]
+    try:
+        existing_order_status = _fetch_existing_order_status_by_order_id(supabase, order_id_list)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Doc order_status hien co loi: {exc}",
+        ) from exc
+
+    skipped_already_paid = 0
+    rows_to_upsert: list[dict] = []
+    for r in rows:
+        oid = str(r.get("order_id") or "").strip()
+        prev = existing_order_status.get(oid)
+        if str(prev or "").strip() == ORDER_STATUS_PAID_SYNCED:
+            skipped_already_paid += 1
+        else:
+            rows_to_upsert.append(r)
+    _apply_order_status_transition(rows_to_upsert, existing_order_status)
+
+    return {
+        "rows_to_upsert": rows_to_upsert,
+        "skipped_already_paid": skipped_already_paid,
+        "unique_orders_from_file": len(rows),
+        "sub_id_values": sub_id_values,
+        "convert_info_map": convert_info_map,
+        "matched_convert": matched_convert,
+        "matched_contact": matched_contact,
+        "matched_config": matched_config,
+        "missing_config": missing_config,
+    }
+
+
+def _preview_item_sort_key(item: dict) -> tuple[int, str]:
+    """Uu tien hien thi: loi split -> Da huy -> doi trang thai -> se cap nhat -> khong doi."""
+    if item.get("split_issue"):
+        rank = 0
+    elif _is_order_status_cancelled(item.get("order_status")):
+        rank = 1
+    elif item.get("order_status_transition"):
+        rank = 2
+    elif item.get("is_unchanged"):
+        rank = 4
+    else:
+        rank = 3
+    return (rank, str(item.get("order_id") or ""))
+
+
+def _build_import_preview_items(
+    supabase,
+    rows_to_upsert: list[dict],
+    convert_info_map: dict[str, dict[str, str | None]],
+    *,
+    existing_by_order_id: dict[str, dict] | None = None,
+) -> list[dict]:
+    out: list[dict] = []
+    group_cache: dict[str, tuple[str | None, str | None]] = {}
+    agency_ids_for_lookup: set[str] = set()
+    for row in rows_to_upsert:
+        sub_id1 = str(row.get("sub_id1") or "").strip()
+        convert_info = convert_info_map.get(sub_id1) if sub_id1 else None
+        group_id = str((convert_info or {}).get("group_id") or "").strip() or None
+
+        agency_id_zl = None
+        owner_id_zl_main = None
+        split_issue = None
+        if not sub_id1:
+            split_issue = "thieu_sub_id1"
+        elif not convert_info:
+            split_issue = "thieu_convert_results"
+        elif not group_id:
+            split_issue = "thieu_group_id"
+        else:
+            if group_id not in group_cache:
+                group_cache[group_id] = _fetch_group_owner_and_agency_id_zl(supabase, group_id)
+            agency_id_zl, owner_id_zl_main = group_cache[group_id]
+            if not owner_id_zl_main:
+                split_issue = "thieu_id_zl_main"
+        if agency_id_zl:
+            agency_ids_for_lookup.add(agency_id_zl)
+
+        net = float(row.get("net_affiliate_commission") or 0)
+        oid = str(row.get("order_id") or "").strip()
+        db_row = (existing_by_order_id or {}).get(oid) if oid else None
+        is_unchanged = (
+            db_row is not None and _incoming_commission_row_equals_db(row, db_row)
+        )
+        out.append(
+            {
+                "order_id": oid,
+                "order_status": str(row.get("order_status") or ""),
+                "order_status_transition": row.get("order_status_transition"),
+                "is_unchanged": is_unchanged,
+                "net_affiliate_commission": net,
+                "id_zl": row.get("id_zl"),
+                "name": row.get("name"),
+                "hh_user": row.get("hh_user"),
+                "group_id": group_id,
+                "agency_id_zl": agency_id_zl,
+                "agency_name": None,
+                "owner_id_zl_main": owner_id_zl_main,
+                "agency_amount": round((net * SPLIT_AGENCY_PCT) / 100.0, 4),
+                "owner_amount": round((net * SPLIT_OWNER_PCT) / 100.0, 4),
+                "split_issue": split_issue,
+            }
+        )
+    if agency_ids_for_lookup:
+        agency_contact_map = _build_contact_map(supabase, sorted(agency_ids_for_lookup))
+        for item in out:
+            zid = str(item.get("agency_id_zl") or "").strip()
+            if zid:
+                item["agency_name"] = (agency_contact_map.get(zid) or {}).get("name")
+    out.sort(key=_preview_item_sort_key)
+    return out
+
+
 @router.post("/sync-hh-to-zalo")
 def sync_hh_to_zalo():
     """
@@ -527,6 +801,72 @@ def sync_hh_to_zalo():
     return payload
 
 
+@router.post("/import-preview")
+async def import_commission_report_preview(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Thieu ten file")
+    suffix = file.filename.lower()
+    if not (suffix.endswith(".csv") or suffix.endswith(".xlsx") or suffix.endswith(".xls")):
+        raise HTTPException(status_code=400, detail="Chi ho tro file .csv, .xlsx hoac .xls")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="File rong")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File vuot qua 15MB")
+
+    analyzed = _analyze_import_rows(content, file.filename)
+    supabase = get_supabase_client()
+    order_ids_preview = [
+        str(r.get("order_id") or "").strip()
+        for r in analyzed["rows_to_upsert"]
+        if str(r.get("order_id") or "").strip()
+    ]
+    existing_map = _fetch_orders_map_by_order_id(supabase, order_ids_preview)
+    rows_for_upsert, would_skip_unchanged = _partition_rows_skip_unchanged(
+        supabase, analyzed["rows_to_upsert"]
+    )
+    preview_items = _build_import_preview_items(
+        supabase,
+        analyzed["rows_to_upsert"],
+        analyzed["convert_info_map"],
+        existing_by_order_id=existing_map,
+    )
+    preview_with_issue = sum(1 for item in preview_items if item.get("split_issue"))
+    preview_counts = {
+        "total": len(preview_items),
+        "issue": preview_with_issue,
+        "cancelled": sum(
+            1 for item in preview_items if _is_order_status_cancelled(item.get("order_status"))
+        ),
+        "transition": sum(1 for item in preview_items if item.get("order_status_transition")),
+        "unchanged": sum(1 for item in preview_items if item.get("is_unchanged")),
+    }
+    return {
+        "ok": True,
+        "source_filename": file.filename,
+        "unique_orders": analyzed["unique_orders_from_file"],
+        "would_upsert": len(rows_for_upsert),
+        "would_skip_unchanged": would_skip_unchanged,
+        "skipped_already_paid": analyzed["skipped_already_paid"],
+        "preview_items": preview_items,
+        "preview_with_issue": preview_with_issue,
+        "preview_counts": preview_counts,
+        "lookup": {
+            "sub_id1_count": len(analyzed["sub_id_values"]),
+            "matched_convert_results": analyzed["matched_convert"],
+            "missing_convert_results": len(analyzed["sub_id_values"])
+            - len(analyzed["convert_info_map"]),
+            "matched_zalo_contacts": analyzed["matched_contact"],
+            "missing_zalo_contacts": max(
+                analyzed["matched_convert"] - analyzed["matched_contact"], 0
+            ),
+            "matched_commission_config": analyzed["matched_config"],
+            "missing_commission_config": analyzed["missing_config"],
+        },
+    }
+
+
 @router.post("/import")
 async def import_commission_report(file: UploadFile = File(...)):
     """
@@ -538,36 +878,31 @@ async def import_commission_report(file: UploadFile = File(...)):
 
     suffix = file.filename.lower()
     if not (suffix.endswith(".csv") or suffix.endswith(".xlsx") or suffix.endswith(".xls")):
-        raise HTTPException(
-            status_code=400,
-            detail="Chi ho tro file .csv, .xlsx hoac .xls",
-        )
+        raise HTTPException(status_code=400, detail="Chi ho tro file .csv, .xlsx hoac .xls")
 
     content = await file.read()
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="File rong")
-
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="File vuot qua 15MB")
 
-    try:
-        rows = parse_and_aggregate_report(content, file.filename)
-        logger.info(
-            "[commission-import] parsed rows=%s unique_orders=%s",
-            len(rows),
-            len(rows),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Doc file loi: {exc}") from exc
+    analyzed = _analyze_import_rows(content, file.filename)
+    rows = analyzed["rows_to_upsert"]
+    skipped_already_paid_count = analyzed["skipped_already_paid"]
+    unique_orders_from_file = analyzed["unique_orders_from_file"]
+    sub_id_values = analyzed["sub_id_values"]
+    convert_info_map = analyzed["convert_info_map"]
+    matched_convert = analyzed["matched_convert"]
+    matched_contact = analyzed["matched_contact"]
+    matched_config = analyzed["matched_config"]
+    missing_config = analyzed["missing_config"]
 
-    if not rows:
+    if unique_orders_from_file == 0:
         return {
             "upserted": 0,
             "unique_orders": 0,
             "skipped_already_paid": 0,
-            "paid_placed_at_refreshed": 0,
+            "skipped_unchanged": 0,
             "import_batch_id": None,
             "split_sync": {
                 "splits_rows_upserted": 0,
@@ -578,172 +913,25 @@ async def import_commission_report(file: UploadFile = File(...)):
         }
 
     supabase = get_supabase_client()
-    for row in rows:
-        row["source_filename"] = file.filename
-        row["id_zl"] = None
-        row["name"] = None
-        row["hh_user"] = 0
-
-    sub_id_values = sorted(
-        {
-            str(row.get("sub_id1") or "").strip()
-            for row in rows
-            if str(row.get("sub_id1") or "").strip()
-        }
-    )
-    logger.info("[commission-import] unique sub_id1 count=%s", len(sub_id_values))
-    if sub_id_values:
-        logger.info(
-            "[commission-import] sub_id1 sample=%s",
-            sub_id_values[:10],
-        )
-
-    try:
-        convert_info_map = _build_convert_info_map(supabase, sub_id_values)
-        zl_values = sorted(
-            {
-                str(info.get("zl") or "").strip()
-                for info in convert_info_map.values()
-                if str(info.get("zl") or "").strip()
-            }
-        )
-        contact_map = _build_contact_map(supabase, zl_values)
-        config_rows = _build_commission_config_rows(supabase)
-        missing_convert = [value for value in sub_id_values if value not in convert_info_map]
-        missing_contacts = [value for value in zl_values if value not in contact_map]
-        logger.info(
-            "[commission-import] convert_results matched=%s missing=%s",
-            len(convert_info_map),
-            len(missing_convert),
-        )
-        if missing_convert:
-            logger.warning(
-                "[commission-import] missing convert_results.id_zl sample=%s",
-                missing_convert[:20],
-            )
-        logger.info(
-            "[commission-import] zalo_contacts(id_from) matched=%s missing=%s",
-            len(contact_map),
-            len(missing_contacts),
-        )
-        if missing_contacts:
-            logger.warning(
-                "[commission-import] missing zalo_contacts.id_from sample=%s",
-                missing_contacts[:20],
-            )
-        if convert_info_map:
-            sample_map = {key: convert_info_map[key] for key in list(convert_info_map)[:10]}
-            logger.info(
-                "[commission-import] sample sub_id1->convert_info mapping=%s",
-                sample_map,
-            )
-        logger.info(
-            "[commission-import] active commission_config rows=%s",
-            len(config_rows),
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Tra cuu convert_results/zalo_contacts loi: {exc}",
-        ) from exc
-
-    matched_convert = 0
-    matched_contact = 0
-    matched_config = 0
-    missing_config = 0
-    for row in rows:
-        sub_id1 = str(row.get("sub_id1") or "").strip()
-        if not sub_id1:
-            continue
-
-        convert_info = convert_info_map.get(sub_id1)
-        if not convert_info:
-            continue
-        matched_convert += 1
-        zl = str(convert_info.get("zl") or "").strip()
-        group_id = str(convert_info.get("group_id") or "").strip() or None
-
-        contact = contact_map.get(zl)
-        if not contact:
-            continue
-
-        payout_pct = _pick_payout_pct(config_rows, group_id=group_id, id_from=zl)
-        if payout_pct is None:
-            missing_config += 1
-            payout_pct = 0
-        else:
-            matched_config += 1
-
-        net_commission = float(row.get("net_affiliate_commission") or 0)
-        row["id_zl"] = zl
-        row["name"] = contact.get("name")
-        row["hh_user"] = round((net_commission * payout_pct) / 100, 4)
-        matched_contact += 1
-
     logger.info(
-        "[commission-import] enrich summary matched_convert=%s matched_contact=%s matched_config=%s missing_config=%s",
-        matched_convert,
-        matched_contact,
-        matched_config,
-        missing_config,
-    )
-
-    order_id_list = [str(r.get("order_id") or "") for r in rows]
-    try:
-        existing_order_status = _fetch_existing_order_status_by_order_id(supabase, order_id_list)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Doc order_status hien co loi: {exc}",
-        ) from exc
-
-    unique_orders_from_file = len(rows)
-    rows_paid_ts: list[dict] = []
-    rows_to_upsert: list[dict] = []
-    for r in rows:
-        oid = str(r.get("order_id") or "").strip()
-        prev = existing_order_status.get(oid)
-        if str(prev or "").strip() == ORDER_STATUS_PAID_SYNCED:
-            rows_paid_ts.append(r)
-        else:
-            rows_to_upsert.append(r)
-
-    paid_placed_at_refreshed = 0
-    for pr in rows_paid_ts:
-        oid = str(pr.get("order_id") or "").strip()
-        if not oid:
-            continue
-        try:
-            supabase.table("affiliate_commission_orders").update(
-                {
-                    "order_placed_at": pr["order_placed_at"],
-                    "source_filename": pr.get("source_filename"),
-                }
-            ).eq("order_id", oid).execute()
-            paid_placed_at_refreshed += 1
-        except Exception as exc:
-            logger.exception(
-                "[commission-import] paid order placed_at refresh failed order_id=%s",
-                oid,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail=f"Cap nhat thoi gian dat don Da cong tien loi: {exc}",
-            ) from exc
-
-    rows = rows_to_upsert
-    logger.info(
-        "[commission-import] paid_placed_at_refreshed=%s remaining_for_upsert=%s",
-        paid_placed_at_refreshed,
+        "[commission-import] skipped_already_paid=%s before_filter_upsert=%s",
+        skipped_already_paid_count,
         len(rows),
+    )
+
+    rows, skipped_unchanged = _partition_rows_skip_unchanged(supabase, rows)
+    logger.info(
+        "[commission-import] after_skip_unchanged remaining_for_upsert=%s skipped_unchanged=%s",
+        len(rows),
+        skipped_unchanged,
     )
 
     if not rows:
         return {
             "upserted": 0,
             "unique_orders": unique_orders_from_file,
-            "skipped_already_paid": 0,
-            "paid_placed_at_refreshed": paid_placed_at_refreshed,
+            "skipped_already_paid": skipped_already_paid_count,
+            "skipped_unchanged": skipped_unchanged,
             "source_filename": file.filename,
             "import_batch_id": None,
             "split_sync": {
@@ -762,8 +950,6 @@ async def import_commission_report(file: UploadFile = File(...)):
             },
         }
 
-    _apply_order_status_transition(rows, existing_order_status)
-
     import_batch_id = str(uuid.uuid4())
     upserted = 0
     for start in range(0, len(rows), UPSERT_CHUNK):
@@ -779,7 +965,6 @@ async def import_commission_report(file: UploadFile = File(...)):
                 detail=f"Luu Supabase loi: {exc}",
             ) from exc
         upserted += len(chunk)
-    logger.info("[commission-import] upsert done upserted=%s", upserted)
 
     split_stats = {
         "splits_rows_upserted": 0,
@@ -808,17 +993,12 @@ async def import_commission_report(file: UploadFile = File(...)):
                 status_code=500,
                 detail=f"Dong bo splits loi: {exc}",
             ) from exc
-        logger.info(
-            "[commission-import] splits done import_batch_id=%s stats=%s",
-            import_batch_id,
-            split_stats,
-        )
 
     return {
         "upserted": upserted,
         "unique_orders": unique_orders_from_file,
-        "skipped_already_paid": 0,
-        "paid_placed_at_refreshed": paid_placed_at_refreshed,
+        "skipped_already_paid": skipped_already_paid_count,
+        "skipped_unchanged": skipped_unchanged,
         "source_filename": file.filename,
         "import_batch_id": import_batch_id,
         "split_sync": split_stats,
