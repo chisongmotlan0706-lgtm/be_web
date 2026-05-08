@@ -3,8 +3,9 @@ import uuid
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 
+from app.auth import get_current_user
 from app.commission_report import parse_and_aggregate_report
 from app.db import get_supabase_client
 
@@ -230,6 +231,232 @@ def _fetch_orders_map_by_order_id(supabase, order_ids: list[str]) -> dict[str, d
     return out
 
 
+def _fetch_orders_for_summary(
+    supabase,
+    *,
+    placed_within_days: int | None,
+    page_size: int = 1000,
+) -> list[dict]:
+    out: list[dict] = []
+    start_utc = None
+    end_utc = None
+    if placed_within_days is not None:
+        start_utc, end_utc = _placed_within_vn_calendar_to_now(placed_within_days)
+    offset = 0
+    while True:
+        query = (
+            supabase.table("affiliate_commission_orders")
+            .select("hh_user,order_status")
+            .order("id")
+            .range(offset, offset + page_size - 1)
+        )
+        if start_utc is not None and end_utc is not None:
+            query = query.gte("order_placed_at", start_utc.isoformat()).lte(
+                "order_placed_at", end_utc.isoformat()
+            )
+        result = query.execute()
+        rows = result.data or []
+        if not rows:
+            break
+        out.extend(rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return out
+
+
+def _fetch_splits_for_summary(
+    supabase,
+    *,
+    placed_within_days: int | None,
+    page_size: int = 1000,
+) -> list[dict]:
+    out: list[dict] = []
+    start_utc = None
+    end_utc = None
+    if placed_within_days is not None:
+        start_utc, end_utc = _placed_within_vn_calendar_to_now(placed_within_days)
+    offset = 0
+    while True:
+        query = (
+            supabase.table(SPLIT_TABLE)
+            .select("split_role,amount,order_status")
+            .order("id")
+            .range(offset, offset + page_size - 1)
+        )
+        if start_utc is not None and end_utc is not None:
+            query = query.gte("created_at", start_utc.isoformat()).lte(
+                "created_at", end_utc.isoformat()
+            )
+        result = query.execute()
+        rows = result.data or []
+        if not rows:
+            break
+        out.extend(rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return out
+
+
+def _fetch_zalo_contacts_available_total(supabase) -> float:
+    total = 0.0
+    offset = 0
+    page_size = 1000
+    while True:
+        result = (
+            supabase.table("zalo_contacts")
+            .select("available_amount")
+            .order("id_from")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            break
+        for row in rows:
+            total += float(row.get("available_amount") or 0)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return total
+
+
+def _fetch_group_id_zl_set_by_owner(
+    supabase, *, owner_id_zl_main: str, active_only: bool
+) -> set[str]:
+    out: set[str] = set()
+    owner = str(owner_id_zl_main or "").strip()
+    if not owner:
+        return out
+    offset = 0
+    page_size = 1000
+    while True:
+        query = (
+            supabase.table("zalo_groups")
+            .select("id_zl")
+            .eq("id_zl_main", owner)
+            .is_("deleted_at", "null")
+            .order("id")
+            .range(offset, offset + page_size - 1)
+        )
+        if active_only:
+            query = query.eq("status", "ACTIVE")
+        result = query.execute()
+        rows = result.data or []
+        if not rows:
+            break
+        for row in rows:
+            zid = str(row.get("id_zl") or "").strip()
+            if zid:
+                out.add(zid)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return out
+
+
+def _fetch_order_balance_maps_by_id_zl(
+    supabase, *, allowed_id_zl: set[str] | None = None
+) -> tuple[dict[str, float], dict[str, float]]:
+    pending_map: dict[str, float] = {}
+    completed_map: dict[str, float] = {}
+    allowed = allowed_id_zl or set()
+    offset = 0
+    page_size = 1000
+    while True:
+        result = (
+            supabase.table("affiliate_commission_orders")
+            .select("id_zl,hh_user,order_status")
+            .order("id")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            break
+        for row in rows:
+            id_zl = str(row.get("id_zl") or "").strip()
+            if not id_zl:
+                continue
+            if allowed and id_zl not in allowed:
+                continue
+            status = str(row.get("order_status") or "").strip()
+            if _is_order_status_cancelled(status):
+                continue
+            amount = float(row.get("hh_user") or 0)
+            if status == "Đang chờ xử lý":
+                pending_map[id_zl] = pending_map.get(id_zl, 0.0) + amount
+            elif status == "Hoàn thành":
+                completed_map[id_zl] = completed_map.get(id_zl, 0.0) + amount
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return pending_map, completed_map
+
+
+def _fetch_split_balance_maps_by_id_zl(
+    supabase, active_group_id_zl: set[str]
+) -> tuple[dict[str, float], dict[str, float]]:
+    pending_map: dict[str, float] = {}
+    completed_map: dict[str, float] = {}
+    offset = 0
+    page_size = 1000
+    while True:
+        result = (
+            supabase.table(SPLIT_TABLE)
+            .select("id_zl,amount,order_status")
+            .order("id")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            break
+        for row in rows:
+            id_zl = str(row.get("id_zl") or "").strip()
+            if not id_zl or id_zl not in active_group_id_zl:
+                continue
+            status = str(row.get("order_status") or "").strip()
+            if _is_order_status_cancelled(status):
+                continue
+            amount = float(row.get("amount") or 0)
+            if status == "Đang chờ xử lý":
+                pending_map[id_zl] = pending_map.get(id_zl, 0.0) + amount
+            elif status == "Hoàn thành":
+                completed_map[id_zl] = completed_map.get(id_zl, 0.0) + amount
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return pending_map, completed_map
+
+
+def _fetch_zalo_contacts_by_id_from(
+    supabase, *, id_from_values: list[str], limit: int
+) -> list[dict]:
+    if limit <= 0:
+        return []
+    unique_values = sorted({str(v or "").strip() for v in id_from_values if str(v or "").strip()})
+    if not unique_values:
+        return []
+    out: list[dict] = []
+    for chunk in _chunked(unique_values, LOOKUP_CHUNK):
+        result = (
+            supabase.table("zalo_contacts")
+            .select(
+                "id,id_from,d_name,available_amount,actual_amount,estimated_amount,role,bank_name,stk,updated_at,received"
+            )
+            .in_("id_from", chunk)
+            .execute()
+        )
+        out.extend(result.data or [])
+    out.sort(
+        key=lambda item: str(item.get("updated_at") or ""),
+        reverse=True,
+    )
+    return out[:limit]
+
+
 def _incoming_commission_row_equals_db(incoming: dict, db: dict) -> bool:
     """
     True neu order_status tu file trung voi DB -> khong co "thay doi trang thai" -> bo qua upsert.
@@ -425,6 +652,119 @@ def _sync_commission_order_splits_for_import(
                 ) from exc
 
     return stats
+
+
+@router.get("/summary")
+def get_commission_summary(
+    placed_within_days: int | None = Query(
+        default=None,
+        description=(
+            "Loc du lieu theo khoang 1,3,7,14 ngay. Orders dung order_placed_at; splits dung created_at. "
+            "Bo qua = tat ca."
+        ),
+    ),
+):
+    if placed_within_days is not None and placed_within_days not in PLACED_WITHIN_DAYS_ALLOWED:
+        raise HTTPException(
+            status_code=400,
+            detail="placed_within_days chi chap nhan 1, 3, 7 hoac 14",
+        )
+    try:
+        supabase = get_supabase_client()
+        orders = _fetch_orders_for_summary(supabase, placed_within_days=placed_within_days)
+        splits = _fetch_splits_for_summary(supabase, placed_within_days=placed_within_days)
+        user_available = _fetch_zalo_contacts_available_total(supabase)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query summary loi: {exc}",
+        ) from exc
+
+    user_processing = 0.0
+    user_completed = 0.0
+    for row in orders:
+        status = str(row.get("order_status") or "").strip()
+        hh_user = float(row.get("hh_user") or 0)
+        if _is_order_status_cancelled(status):
+            continue
+        if status == "Hoàn thành":
+            user_completed += hh_user
+        elif status != ORDER_STATUS_PAID_SYNCED:
+            user_processing += hh_user
+
+    agency_total = 0.0
+    owner_total = 0.0
+    for row in splits:
+        status = str(row.get("order_status") or "").strip()
+        if _is_order_status_cancelled(status):
+            continue
+        amount = float(row.get("amount") or 0)
+        role = str(row.get("split_role") or "").strip()
+        if role == SPLIT_ROLE_AGENCY:
+            agency_total += amount
+        elif role == SPLIT_ROLE_PLATFORM_OWNER:
+            owner_total += amount
+
+    return {
+        "user": {
+            "dang_xu_ly": round(user_processing, 4),
+            "hoan_thanh": round(user_completed, 4),
+            "co_san": round(user_available, 4),
+        },
+        "agency": {"tong": round(agency_total, 4)},
+        "owner": {"tong": round(owner_total, 4)},
+        "currency": "VND",
+        "filters": {"placed_within_days": placed_within_days},
+    }
+
+
+@router.get("/zalo-contacts")
+def list_zalo_contacts(
+    limit: int = Query(default=500, ge=1, le=2000),
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        supabase = get_supabase_client()
+        user_id_zl_main = str(current_user.get("id_zl") or "").strip()
+        if not user_id_zl_main:
+            return {"count": 0, "items": []}
+
+        allowed_contact_id_zl = _fetch_group_id_zl_set_by_owner(
+            supabase, owner_id_zl_main=user_id_zl_main, active_only=False
+        )
+        if not allowed_contact_id_zl:
+            return {"count": 0, "items": []}
+
+        order_pending_map, order_completed_map = _fetch_order_balance_maps_by_id_zl(
+            supabase, allowed_id_zl=allowed_contact_id_zl
+        )
+        active_group_id_zl = _fetch_group_id_zl_set_by_owner(
+            supabase, owner_id_zl_main=user_id_zl_main, active_only=True
+        )
+        split_pending_map, split_completed_map = _fetch_split_balance_maps_by_id_zl(
+            supabase, active_group_id_zl
+        )
+        items = _fetch_zalo_contacts_by_id_from(
+            supabase,
+            id_from_values=sorted(allowed_contact_id_zl),
+            limit=limit,
+        )
+        for item in items:
+            id_from = str(item.get("id_from") or "").strip()
+            order_pending = order_pending_map.get(id_from, 0.0)
+            order_completed = order_completed_map.get(id_from, 0.0)
+            split_pending = split_pending_map.get(id_from, 0.0)
+            split_completed = split_completed_map.get(id_from, 0.0)
+            item["dang_giao_hang"] = round(order_pending + split_pending, 4)
+            item["cho_duyet"] = round(order_completed + split_completed, 4)
+            item["tien_co_the_rut"] = round(float(item.get("available_amount") or 0), 4)
+            item["da_rut_ve_bank"] = round(float(item.get("received") or 0), 4)
+        return {"count": len(items), "items": items}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query zalo_contacts loi: {exc}",
+        ) from exc
 
 
 @router.get("/orders")

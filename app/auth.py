@@ -116,7 +116,7 @@ def get_current_user(
     result = (
         get_supabase_client()
         .table("auth_users")
-        .select("id,username,is_active,id_zl")
+        .select("id,username,is_active,id_zl,aff_id")
         .eq("id", user_id)
         .limit(1)
         .execute()

@@ -27,6 +27,10 @@ class RefreshPayload(BaseModel):
     refresh_token: str = Field(..., min_length=20, max_length=2000)
 
 
+class UpdateProfilePayload(BaseModel):
+    aff_id: str = Field(..., min_length=1, max_length=200)
+
+
 @router.post("/login")
 def login(
     payload: LoginPayload,
@@ -110,5 +114,38 @@ def me(user: dict = Depends(get_current_user)):
             "id": user.get("id"),
             "username": user.get("username"),
             "id_zl": user.get("id_zl"),
+            "aff_id": user.get("aff_id"),
         }
     }
+
+
+@router.patch("/me")
+def update_me(payload: UpdateProfilePayload, user: dict = Depends(get_current_user)):
+    aff_id = payload.aff_id.strip()
+    if not aff_id:
+        raise HTTPException(status_code=422, detail="aff_id khong duoc rong")
+    user_id = str(user.get("id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token khong hop le")
+    row = {
+        "aff_id": aff_id,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        supabase = get_supabase_client()
+        supabase.table("auth_users").update(row).eq("id", user_id).execute()
+        result = (
+            supabase.table("auth_users")
+            .select("id,username,id_zl,aff_id")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        updated = (result.data or [None])[0]
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Khong tim thay user")
+        return {"user": updated}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Cap nhat aff_id loi: {exc}") from exc
