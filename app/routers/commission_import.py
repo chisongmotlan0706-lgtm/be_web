@@ -322,10 +322,12 @@ def _fetch_zalo_contacts_available_total(supabase) -> float:
     return total
 
 
-def _fetch_group_id_zl_set_by_owner(
+def _fetch_group_ids_by_owner(
     supabase, *, owner_id_zl_main: str, active_only: bool
-) -> set[str]:
-    out: set[str] = set()
+) -> list[str]:
+    """group_id tu zalo_groups: id_zl_main = owner, chua xoa mem."""
+    out: list[str] = []
+    seen: set[str] = set()
     owner = str(owner_id_zl_main or "").strip()
     if not owner:
         return out
@@ -334,7 +336,7 @@ def _fetch_group_id_zl_set_by_owner(
     while True:
         query = (
             supabase.table("zalo_groups")
-            .select("id_zl")
+            .select("group_id")
             .eq("id_zl_main", owner)
             .is_("deleted_at", "null")
             .order("id")
@@ -347,13 +349,76 @@ def _fetch_group_id_zl_set_by_owner(
         if not rows:
             break
         for row in rows:
-            zid = str(row.get("id_zl") or "").strip()
-            if zid:
-                out.add(zid)
+            gid = str(row.get("group_id") or "").strip()
+            if gid and gid not in seen:
+                seen.add(gid)
+                out.append(gid)
         if len(rows) < page_size:
             break
         offset += page_size
     return out
+
+
+def _fetch_id_from_set_for_group_ids(supabase, group_ids: list[str]) -> set[str]:
+    """Tat ca id_from cua zalo_contacts co id_group thuoc danh sach group_id."""
+    out: set[str] = set()
+    unique_groups = sorted({str(g or "").strip() for g in group_ids if str(g or "").strip()})
+    if not unique_groups:
+        return out
+    page_size = 1000
+    for chunk in _chunked(unique_groups, LOOKUP_CHUNK):
+        offset = 0
+        while True:
+            result = (
+                supabase.table("zalo_contacts")
+                .select("id_from")
+                .in_("id_group", chunk)
+                .order("id")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            rows = result.data or []
+            if not rows:
+                break
+            for row in rows:
+                zid = str(row.get("id_from") or "").strip()
+                if zid:
+                    out.add(zid)
+            if len(rows) < page_size:
+                break
+            offset += page_size
+    return out
+
+
+def _fetch_zalo_contacts_by_id_groups(
+    supabase, *, group_ids: list[str], limit: int
+) -> list[dict]:
+    if limit <= 0:
+        return []
+    unique_groups = sorted({str(g or "").strip() for g in group_ids if str(g or "").strip()})
+    if not unique_groups:
+        return []
+    allowed = set(unique_groups)
+    out: list[dict] = []
+    for chunk in _chunked(unique_groups, LOOKUP_CHUNK):
+        result = (
+            supabase.table("zalo_contacts")
+            .select(
+                "id,id_from,d_name,id_group,available_amount,actual_amount,estimated_amount,"
+                "role,bank_name,stk,updated_at,received"
+            )
+            .in_("id_group", chunk)
+            .execute()
+        )
+        for item in result.data or []:
+            gid = str(item.get("id_group") or "").strip()
+            if gid in allowed:
+                out.append(item)
+    out.sort(
+        key=lambda item: str(item.get("updated_at") or ""),
+        reverse=True,
+    )
+    return out[:limit]
 
 
 def _fetch_order_balance_maps_by_id_zl(
@@ -429,32 +494,6 @@ def _fetch_split_balance_maps_by_id_zl(
             break
         offset += page_size
     return pending_map, completed_map
-
-
-def _fetch_zalo_contacts_by_id_from(
-    supabase, *, id_from_values: list[str], limit: int
-) -> list[dict]:
-    if limit <= 0:
-        return []
-    unique_values = sorted({str(v or "").strip() for v in id_from_values if str(v or "").strip()})
-    if not unique_values:
-        return []
-    out: list[dict] = []
-    for chunk in _chunked(unique_values, LOOKUP_CHUNK):
-        result = (
-            supabase.table("zalo_contacts")
-            .select(
-                "id,id_from,d_name,available_amount,actual_amount,estimated_amount,role,bank_name,stk,updated_at,received"
-            )
-            .in_("id_from", chunk)
-            .execute()
-        )
-        out.extend(result.data or [])
-    out.sort(
-        key=lambda item: str(item.get("updated_at") or ""),
-        reverse=True,
-    )
-    return out[:limit]
 
 
 def _incoming_commission_row_equals_db(incoming: dict, db: dict) -> bool:
@@ -729,24 +768,33 @@ def list_zalo_contacts(
         if not user_id_zl_main:
             return {"count": 0, "items": []}
 
-        allowed_contact_id_zl = _fetch_group_id_zl_set_by_owner(
+        all_group_ids = _fetch_group_ids_by_owner(
             supabase, owner_id_zl_main=user_id_zl_main, active_only=False
         )
+        if not all_group_ids:
+            return {"count": 0, "items": []}
+
+        allowed_contact_id_zl = _fetch_id_from_set_for_group_ids(supabase, all_group_ids)
         if not allowed_contact_id_zl:
             return {"count": 0, "items": []}
 
         order_pending_map, order_completed_map = _fetch_order_balance_maps_by_id_zl(
             supabase, allowed_id_zl=allowed_contact_id_zl
         )
-        active_group_id_zl = _fetch_group_id_zl_set_by_owner(
+        active_group_ids = _fetch_group_ids_by_owner(
             supabase, owner_id_zl_main=user_id_zl_main, active_only=True
         )
-        split_pending_map, split_completed_map = _fetch_split_balance_maps_by_id_zl(
-            supabase, active_group_id_zl
+        active_member_id_zl = (
+            _fetch_id_from_set_for_group_ids(supabase, active_group_ids)
+            if active_group_ids
+            else set()
         )
-        items = _fetch_zalo_contacts_by_id_from(
+        split_pending_map, split_completed_map = _fetch_split_balance_maps_by_id_zl(
+            supabase, active_member_id_zl
+        )
+        items = _fetch_zalo_contacts_by_id_groups(
             supabase,
-            id_from_values=sorted(allowed_contact_id_zl),
+            group_ids=all_group_ids,
             limit=limit,
         )
         for item in items:

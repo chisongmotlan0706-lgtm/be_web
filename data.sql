@@ -79,6 +79,7 @@ CREATE TABLE public.zalo_contacts (
   bank_type text,
   received bigint,
   role text,
+  id_group text,
   CONSTRAINT zalo_contacts_pkey PRIMARY KEY (id)
 );
 CREATE TABLE public.zalo_groups (
@@ -90,5 +91,6 @@ CREATE TABLE public.zalo_groups (
   updated_at timestamp with time zone NOT NULL DEFAULT now(),
   deleted_at timestamp with time zone,
   status text,
+  id_zl_main text,
   CONSTRAINT zalo_groups_pkey PRIMARY KEY (id)
 );

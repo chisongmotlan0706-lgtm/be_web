@@ -222,7 +222,8 @@ api_bot_aff/
 │     ├─ 007_sync_commission_hh_to_zalo_splits.sql
 │     ├─ 008_affiliate_commission_order_splits_rls_fix.sql
 │     ├─ 009_zalo_groups_status.sql
-│     └─ 010_zalo_groups_rls_disable.sql
+│     ├─ 010_zalo_groups_rls_disable.sql
+│     └─ 014_zalo_contacts_id_group_groups_id_zl_main.sql
 ├─ requirements.txt
 └─ README.md
 ```
