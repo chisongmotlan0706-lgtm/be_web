@@ -150,6 +150,30 @@ Cập nhật toàn bộ trường rule theo `config_id`.
 
 Bật/tắt nhanh trạng thái `is_active`.
 
+### `GET /commission-split-config`
+
+Đọc singleton `%` phân tầng (`commission_split_config`).
+
+### `PUT /commission-split-config`
+
+Cập nhật `agency_pct`, `owner_pct`.
+
+### `GET /app-config-kv?limit=200&category=&search=`
+
+Đọc `public.app_config_kv` (key + `value_1`…`value_5`). Lọc `category` (đúng chuỗi), `search` (ilike trên `config_key`).
+
+### `POST /app-config-kv`
+
+Tạo dòng cấu hình KV (body JSON).
+
+### `PUT /app-config-kv/{id}`
+
+Cập nhật theo `id`.
+
+### `DELETE /app-config-kv/{id}`
+
+Xóa cứng theo `id`.
+
 **Form-data**
 
 - `file`: file báo cáo.
@@ -165,6 +189,7 @@ Bật/tắt nhanh trạng thái `is_active`.
   - dùng `sub_id1` tra `convert_results.id_zl` để lấy `zl`,
   - dùng `zl` tra `zalo_contacts` để lấy `id_from`, `name`,
   - lưu `id_from` vào `affiliate_commission_orders.id_zl` và `name` vào `affiliate_commission_orders.name`.
+  - `hh_user` và số tiền split agency/owner: đọc một dòng `app_config_kv` với `config_key = hoa_hong`, `is_active = true`; `value_1`…`value_4` là phần trăm 0–100 (parse từ text). Công thức trên `net_affiliate_commission` (làm tròn 4 chữ số): `net * (100 - value_4) * value_k / 10000` với `value_3` → user (`hh_user`), `value_1` → agency, `value_2` → owner. Không có dòng active → `hh_user` và split amounts = 0; `lookup.matched_commission_config` / `missing_commission_config` đếm theo từng dòng có `zalo_contacts`.
 
 **Response mẫu**
 
@@ -210,6 +235,8 @@ api_bot_aff/
 │  └─ routers/
 │     ├─ commission_import.py # GET orders + payout-sync-logs, POST import + sync-hh-to-zalo
 │     ├─ commission_config.py # CRUD commission_config
+│     ├─ commission_split_config.py # GET/PUT commission_split_config
+│     ├─ app_config_kv.py     # CRUD app_config_kv (key + value_1..5 + label_1..5)
 │     └─ zalo_groups.py       # GET /zalo-groups, PATCH /zalo-groups/{id}, DELETE (xóa cứng)
 ├─ supabase/
 │  └─ migrations/
@@ -223,7 +250,10 @@ api_bot_aff/
 │     ├─ 008_affiliate_commission_order_splits_rls_fix.sql
 │     ├─ 009_zalo_groups_status.sql
 │     ├─ 010_zalo_groups_rls_disable.sql
-│     └─ 014_zalo_contacts_id_group_groups_id_zl_main.sql
+│     ├─ 014_zalo_contacts_id_group_groups_id_zl_main.sql
+│     ├─ 015_commission_split_config.sql
+│     ├─ 016_app_config_kv.sql
+│     └─ 017_app_config_kv_labels.sql
 ├─ requirements.txt
 └─ README.md
 ```

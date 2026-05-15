@@ -1,18 +1,29 @@
 import logging
+import math
+import unicodedata
 import uuid
 from datetime import datetime, time, timedelta, timezone
+from io import BytesIO
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import Response
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 from app.auth import get_current_user
 from app.commission_report import parse_and_aggregate_report
 from app.db import get_supabase_client
+from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/commission-report", tags=["commission-report"])
 logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+PAYOUT_IMPORT_MAX_BYTES = 5 * 1024 * 1024
+_PAYOUT_FLOAT_VND_SLACK = 0.51
 UPSERT_CHUNK = 500
 LOOKUP_CHUNK = 500
 PLACED_WITHIN_DAYS_ALLOWED = frozenset({1, 3, 7, 14})
@@ -22,8 +33,10 @@ _VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 SPLIT_TABLE = "affiliate_commission_order_splits"
 SPLIT_ROLE_AGENCY = "agency"
 SPLIT_ROLE_PLATFORM_OWNER = "platform_owner"
-SPLIT_AGENCY_PCT = 15
-SPLIT_OWNER_PCT = 25
+CONFIG_KEY_CHUYEN_TIEN = "chuyen_tien"
+CONFIG_KEY_HOA_HONG = "hoa_hong"
+_DEFAULT_NOI_DUNG_TEMPLATE = "Ho tro hoa hong {id_from}"
+PAYOUT_STATUS_PAID = "Đã Trả Hoa Hồng"
 
 
 def _placed_within_vn_calendar_to_now(days: int) -> tuple[datetime, datetime]:
@@ -129,44 +142,72 @@ def _build_contact_map(supabase, id_from_values: list[str]) -> dict[str, dict[st
     return mapping
 
 
-def _build_commission_config_rows(supabase) -> list[dict]:
-    result = (
-        supabase.table("commission_config")
-        .select("scope,group_id,id_from,payout_pct,is_active")
-        .eq("is_active", True)
-        .execute()
+def _clamp_pct_0_100(x: float) -> float:
+    if not math.isfinite(x):
+        return 0.0
+    return max(0.0, min(100.0, x))
+
+
+def _parse_app_config_pct_field(raw: object, *, default: float = 0.0) -> float:
+    s = str(raw or "").strip().replace(",", "")
+    if not s:
+        return default
+    try:
+        return _clamp_pct_0_100(float(s))
+    except (ValueError, TypeError):
+        return default
+
+
+def _fetch_hoa_hong_pct_quads(supabase) -> tuple[float, float, float, float, bool]:
+    """
+    app_config_kv.config_key = hoa_hong, is_active:
+    - value_1: agency % (0-100)
+    - value_2: owner (platform) % (0-100)
+    - value_3: user hh % (0-100)
+    - value_4: tru % (0-100) — he so (100 - value_4) / 100 tren net
+    Tra (v1, v2, v3, v4, ok). ok = co dong active.
+    """
+    try:
+        result = (
+            supabase.table("app_config_kv")
+            .select("value_1,value_2,value_3,value_4,is_active")
+            .eq("config_key", CONFIG_KEY_HOA_HONG)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return (0.0, 0.0, 0.0, 0.0, False)
+        row = rows[0]
+        if row.get("is_active") is False:
+            return (0.0, 0.0, 0.0, 0.0, False)
+        v1 = _parse_app_config_pct_field(row.get("value_1"))
+        v2 = _parse_app_config_pct_field(row.get("value_2"))
+        v3 = _parse_app_config_pct_field(row.get("value_3"))
+        v4 = _parse_app_config_pct_field(row.get("value_4"))
+        return (v1, v2, v3, v4, True)
+    except Exception:
+        logger.exception("[commission-import] fetch hoa_hong app_config_kv failed")
+        return (0.0, 0.0, 0.0, 0.0, False)
+
+
+def _amounts_from_hoa_hong_net(
+    net: float, v1: float, v2: float, v3: float, v4: float
+) -> tuple[float, float, float]:
+    """agency, owner, hh_user — cong thuc chuan: net * (100-v4) * vk / 10000."""
+    if not math.isfinite(net):
+        net = 0.0
+    f = (100.0 - v4) / 10000.0
+    return (
+        round(net * f * v1, 4),
+        round(net * f * v2, 4),
+        round(net * f * v3, 4),
     )
-    return result.data or []
 
 
-def _pick_payout_pct(
-    configs: list[dict], group_id: str | None, id_from: str | None
-) -> float | None:
-    for config in configs:
-        if config.get("scope") == "group_id_from":
-            if (
-                group_id
-                and id_from
-                and str(config.get("group_id") or "").strip() == group_id
-                and str(config.get("id_from") or "").strip() == id_from
-            ):
-                return float(config.get("payout_pct") or 0)
-
-    for config in configs:
-        if config.get("scope") == "group":
-            if group_id and str(config.get("group_id") or "").strip() == group_id:
-                return float(config.get("payout_pct") or 0)
-
-    for config in configs:
-        if config.get("scope") == "id_from":
-            if id_from and str(config.get("id_from") or "").strip() == id_from:
-                return float(config.get("payout_pct") or 0)
-
-    for config in configs:
-        if config.get("scope") == "global":
-            return float(config.get("payout_pct") or 0)
-
-    return None
+def _effective_split_payout_pct_on_net(role_pct: float, v4: float) -> float:
+    """% cua net tuong ung amount (de luu payout_pct tren bang splits)."""
+    return round((100.0 - v4) * role_pct / 100.0, 4)
 
 
 def _is_order_status_cancelled(order_status: str | None) -> bool:
@@ -322,6 +363,53 @@ def _fetch_zalo_contacts_available_total(supabase) -> float:
     return total
 
 
+def _is_admin_zalo_contact_role(role: object) -> bool:
+    """ADMIN = chu tool / quan tri; khong hien thi trong danh sach user + dai ly."""
+    return str(role or "").strip().upper() == "ADMIN"
+
+
+def _fetch_chuyen_tien_settings(supabase) -> tuple[float, str]:
+    """
+    app_config_kv.config_key = chuyen_tien:
+    - value_1: nguong VND toi thieu (available_amount) de hien thi / export.
+    - value_2: tuy chon — mau noi dung CK; ho tro {id_from}, {d_name}. Neu trong -> mac dinh.
+    Chi ap nguong khi dong ton tai, is_active, value_1 parse duoc > 0.
+    """
+    try:
+        result = (
+            supabase.table("app_config_kv")
+            .select("value_1,value_2,is_active")
+            .eq("config_key", CONFIG_KEY_CHUYEN_TIEN)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return (0.0, _DEFAULT_NOI_DUNG_TEMPLATE)
+        row = rows[0]
+        if row.get("is_active") is False:
+            return (0.0, _DEFAULT_NOI_DUNG_TEMPLATE)
+        raw = str(row.get("value_1") or "").strip().replace(",", "")
+        min_vnd = max(0.0, float(raw)) if raw else 0.0
+        v2 = str(row.get("value_2") or "").strip()
+        template = v2 if v2 else _DEFAULT_NOI_DUNG_TEMPLATE
+        return (min_vnd, template)
+    except (ValueError, TypeError, Exception):
+        return (0.0, _DEFAULT_NOI_DUNG_TEMPLATE)
+
+
+def _format_noi_dung_ck(template: str, *, id_from: str, d_name: str) -> str:
+    safe_name = (d_name or "").strip() or id_from
+    try:
+        return str(template).format(id_from=id_from, d_name=safe_name)
+    except (KeyError, ValueError, IndexError):
+        return (
+            str(template)
+            .replace("{id_from}", id_from)
+            .replace("{d_name}", safe_name)
+        )
+
+
 def _fetch_group_ids_by_owner(
     supabase, *, owner_id_zl_main: str, active_only: bool
 ) -> list[str]:
@@ -391,7 +479,11 @@ def _fetch_id_from_set_for_group_ids(supabase, group_ids: list[str]) -> set[str]
 
 
 def _fetch_zalo_contacts_by_id_groups(
-    supabase, *, group_ids: list[str], limit: int
+    supabase,
+    *,
+    group_ids: list[str],
+    limit: int,
+    min_available_amount: float | None = None,
 ) -> list[dict]:
     if limit <= 0:
         return []
@@ -401,15 +493,17 @@ def _fetch_zalo_contacts_by_id_groups(
     allowed = set(unique_groups)
     out: list[dict] = []
     for chunk in _chunked(unique_groups, LOOKUP_CHUNK):
-        result = (
+        query = (
             supabase.table("zalo_contacts")
             .select(
                 "id,id_from,d_name,id_group,available_amount,actual_amount,estimated_amount,"
                 "role,bank_name,stk,updated_at,received"
             )
             .in_("id_group", chunk)
-            .execute()
         )
+        if min_available_amount is not None and min_available_amount > 0:
+            query = query.gte("available_amount", min_available_amount)
+        result = query.execute()
         for item in result.data or []:
             gid = str(item.get("id_group") or "").strip()
             if gid in allowed:
@@ -533,6 +627,10 @@ def _sync_commission_order_splits_for_import(
     orders_from_db: list[dict],
     import_batch_id: str,
     convert_info_map: dict[str, dict[str, str | None]],
+    *,
+    hoa_v1: float,
+    hoa_v2: float,
+    hoa_v4: float,
 ) -> dict[str, int]:
     """
     Dong bo affiliate_commission_order_splits sau khi upsert don chinh.
@@ -620,8 +718,11 @@ def _sync_commission_order_splits_for_import(
                 detail=f"Khong tim thay id_zl_main trong zalo_groups cho group_id={group_id_res} (order_id={oid})",
             )
 
-        owner_amount = round((net * SPLIT_OWNER_PCT) / 100.0, 4)
-        agency_amount = round((net * SPLIT_AGENCY_PCT) / 100.0, 4)
+        agency_amount, owner_amount, _ = _amounts_from_hoa_hong_net(
+            net, hoa_v1, hoa_v2, 0.0, hoa_v4
+        )
+        agency_pct_stored = _effective_split_payout_pct_on_net(hoa_v1, hoa_v4)
+        owner_pct_stored = _effective_split_payout_pct_on_net(hoa_v2, hoa_v4)
 
         split_rows: list[dict] = []
         if agency_id_zl:
@@ -632,7 +733,7 @@ def _sync_commission_order_splits_for_import(
                     "split_role": SPLIT_ROLE_AGENCY,
                     "id_zl": agency_id_zl,
                     "group_id": group_id_res,
-                    "payout_pct": SPLIT_AGENCY_PCT,
+                    "payout_pct": agency_pct_stored,
                     "amount": agency_amount,
                     "net_affiliate_commission_at_split": net,
                     "order_status": order_status,
@@ -647,7 +748,7 @@ def _sync_commission_order_splits_for_import(
                 "split_role": SPLIT_ROLE_PLATFORM_OWNER,
                 "id_zl": owner_id_zl_main,
                 "group_id": group_id_res,
-                "payout_pct": SPLIT_OWNER_PCT,
+                "payout_pct": owner_pct_stored,
                 "amount": owner_amount,
                 "net_affiliate_commission_at_split": net,
                 "order_status": order_status,
@@ -757,6 +858,117 @@ def get_commission_summary(
     }
 
 
+def _enriched_zalo_contacts_for_owner(
+    supabase,
+    *,
+    user_id_zl_main: str,
+    limit: int,
+    min_available_amount: float | None,
+) -> list[dict]:
+    owner = str(user_id_zl_main or "").strip()
+    if not owner:
+        return []
+
+    all_group_ids = _fetch_group_ids_by_owner(
+        supabase, owner_id_zl_main=owner, active_only=False
+    )
+    if not all_group_ids:
+        return []
+
+    allowed_contact_id_zl = _fetch_id_from_set_for_group_ids(supabase, all_group_ids)
+    if not allowed_contact_id_zl:
+        return []
+
+    order_pending_map, order_completed_map = _fetch_order_balance_maps_by_id_zl(
+        supabase, allowed_id_zl=allowed_contact_id_zl
+    )
+    active_group_ids = _fetch_group_ids_by_owner(
+        supabase, owner_id_zl_main=owner, active_only=True
+    )
+    active_member_id_zl = (
+        _fetch_id_from_set_for_group_ids(supabase, active_group_ids)
+        if active_group_ids
+        else set()
+    )
+    split_pending_map, split_completed_map = _fetch_split_balance_maps_by_id_zl(
+        supabase, active_member_id_zl
+    )
+    items = _fetch_zalo_contacts_by_id_groups(
+        supabase,
+        group_ids=all_group_ids,
+        limit=limit,
+        min_available_amount=min_available_amount,
+    )
+    items = [it for it in items if not _is_admin_zalo_contact_role(it.get("role"))]
+    for item in items:
+        id_from = str(item.get("id_from") or "").strip()
+        order_pending = order_pending_map.get(id_from, 0.0)
+        order_completed = order_completed_map.get(id_from, 0.0)
+        split_pending = split_pending_map.get(id_from, 0.0)
+        split_completed = split_completed_map.get(id_from, 0.0)
+        item["dang_giao_hang"] = round(order_pending + split_pending, 4)
+        item["cho_duyet"] = round(order_completed + split_completed, 4)
+        item["tien_co_the_rut"] = float(_floor_vnd_to_thousand(float(item.get("available_amount") or 0)))
+        item["da_rut_ve_bank"] = round(float(item.get("received") or 0), 4)
+    return items
+
+
+def _zalo_contacts_transfer_workbook(items: list[dict], *, noi_dung_template: str) -> BytesIO:
+    """Export: STT, id_from, id_group, so tien, TK, ten, NH, noi dung, cot trang thai (de dien sau CK)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Chuyen tien"
+
+    headers = [
+        "STT",
+        "id_from",
+        "id_group",
+        "Số tiền chuyển",
+        "TK hưởng",
+        "Tên người hưởng",
+        "Tên ngân hàng",
+        "Nội dung",
+        "Hoàn Tiền chưa",
+    ]
+    ws.append(headers)
+    header_fill = PatternFill(fill_type="solid", fgColor="D9D9D9")
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for idx, item in enumerate(items, start=1):
+        id_from = str(item.get("id_from") or "").strip()
+        id_group = str(item.get("id_group") or "").strip()
+        d_name = str(item.get("d_name") or "").strip()
+        bank = str(item.get("bank_name") or "").strip()
+        stk_raw = str(item.get("stk") or "").strip()
+        amt = _floor_vnd_to_thousand(float(item.get("available_amount") or 0))
+        noi = _format_noi_dung_ck(noi_dung_template, id_from=id_from, d_name=d_name)
+        row_num = ws.max_row + 1
+        ws.cell(row=row_num, column=1, value=idx)
+        c_id = ws.cell(row=row_num, column=2, value=id_from if id_from else "")
+        c_id.number_format = "@"
+        c_gid = ws.cell(row=row_num, column=3, value=id_group if id_group else "")
+        c_gid.number_format = "@"
+        ws.cell(row=row_num, column=4, value=amt)
+        c_stk = ws.cell(row=row_num, column=5, value=stk_raw if stk_raw else "")
+        c_stk.number_format = "@"
+        ws.cell(row=row_num, column=6, value=d_name if d_name else id_from)
+        ws.cell(row=row_num, column=7, value=bank)
+        ws.cell(row=row_num, column=8, value=noi)
+        ws.cell(row=row_num, column=9, value="")
+
+    widths = (6, 18, 18, 16, 18, 28, 22, 40, 22)
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio
+
+
 @router.get("/zalo-contacts")
 def list_zalo_contacts(
     limit: int = Query(default=500, ge=1, le=2000),
@@ -765,53 +977,463 @@ def list_zalo_contacts(
     try:
         supabase = get_supabase_client()
         user_id_zl_main = str(current_user.get("id_zl") or "").strip()
-        if not user_id_zl_main:
-            return {"count": 0, "items": []}
-
-        all_group_ids = _fetch_group_ids_by_owner(
-            supabase, owner_id_zl_main=user_id_zl_main, active_only=False
-        )
-        if not all_group_ids:
-            return {"count": 0, "items": []}
-
-        allowed_contact_id_zl = _fetch_id_from_set_for_group_ids(supabase, all_group_ids)
-        if not allowed_contact_id_zl:
-            return {"count": 0, "items": []}
-
-        order_pending_map, order_completed_map = _fetch_order_balance_maps_by_id_zl(
-            supabase, allowed_id_zl=allowed_contact_id_zl
-        )
-        active_group_ids = _fetch_group_ids_by_owner(
-            supabase, owner_id_zl_main=user_id_zl_main, active_only=True
-        )
-        active_member_id_zl = (
-            _fetch_id_from_set_for_group_ids(supabase, active_group_ids)
-            if active_group_ids
-            else set()
-        )
-        split_pending_map, split_completed_map = _fetch_split_balance_maps_by_id_zl(
-            supabase, active_member_id_zl
-        )
-        items = _fetch_zalo_contacts_by_id_groups(
+        min_vnd, _tpl = _fetch_chuyen_tien_settings(supabase)
+        min_arg = min_vnd if min_vnd > 0 else None
+        items = _enriched_zalo_contacts_for_owner(
             supabase,
-            group_ids=all_group_ids,
+            user_id_zl_main=user_id_zl_main,
             limit=limit,
+            min_available_amount=min_arg,
         )
-        for item in items:
-            id_from = str(item.get("id_from") or "").strip()
-            order_pending = order_pending_map.get(id_from, 0.0)
-            order_completed = order_completed_map.get(id_from, 0.0)
-            split_pending = split_pending_map.get(id_from, 0.0)
-            split_completed = split_completed_map.get(id_from, 0.0)
-            item["dang_giao_hang"] = round(order_pending + split_pending, 4)
-            item["cho_duyet"] = round(order_completed + split_completed, 4)
-            item["tien_co_the_rut"] = round(float(item.get("available_amount") or 0), 4)
-            item["da_rut_ve_bank"] = round(float(item.get("received") or 0), 4)
-        return {"count": len(items), "items": items}
+        filters: dict[str, float | None] = {}
+        if min_vnd > 0:
+            filters["min_available_vnd_chuyen_tien"] = round(min_vnd, 4)
+        else:
+            filters["min_available_vnd_chuyen_tien"] = None
+        return {"count": len(items), "items": items, "filters": filters}
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Query zalo_contacts loi: {exc}",
+        ) from exc
+
+
+@router.get("/zalo-contacts/export")
+def export_zalo_contacts_xlsx(
+    limit: int = Query(default=2000, ge=1, le=5000),
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        supabase = get_supabase_client()
+        user_id_zl_main = str(current_user.get("id_zl") or "").strip()
+        min_vnd, noi_tpl = _fetch_chuyen_tien_settings(supabase)
+        min_arg = min_vnd if min_vnd > 0 else None
+        items = _enriched_zalo_contacts_for_owner(
+            supabase,
+            user_id_zl_main=user_id_zl_main,
+            limit=limit,
+            min_available_amount=min_arg,
+        )
+        bio = _zalo_contacts_transfer_workbook(items, noi_dung_template=noi_tpl)
+        data = bio.getvalue()
+        filename_ascii = "Danh_sach_KH.xlsx"
+        return Response(
+            content=data,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename_ascii}"',
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Export zalo_contacts loi: {exc}",
+        ) from exc
+
+
+def _fold_col_name(s: str) -> str:
+    t = unicodedata.normalize("NFD", str(s or "").strip().lower())
+    return "".join(c for c in t if unicodedata.category(c) != "Mn").replace(" ", "")
+
+
+def _pick_id_from_column(columns: list[str]) -> str | None:
+    for c in columns:
+        f = _fold_col_name(c)
+        if f in ("idfrom", "id_from") or "mazalo" in f or f.endswith("idfrom"):
+            return c
+    return None
+
+
+def _pick_amount_column(columns: list[str]) -> str | None:
+    for c in columns:
+        f = _fold_col_name(c)
+        # "Số tiền chuyển" -> fold "sotienchuyen" (tien, khong phai "sotientchuyen")
+        if "sotienchuyen" in f or "sotientchuyen" in f:
+            return c
+    return None
+
+
+def _pick_status_column(columns: list[str]) -> str | None:
+    for c in columns:
+        f = _fold_col_name(c)
+        if "hoantienchua" in f or f == "trangthai" or "trangthai" in f:
+            return c
+    return None
+
+
+def _payout_status_cell_norm(v: object) -> str:
+    return " ".join(str(v if v is not None else "").strip().lower().split())
+
+
+def _is_payout_paid_cell(v: object) -> bool:
+    return _payout_status_cell_norm(v) == _payout_status_cell_norm(PAYOUT_STATUS_PAID)
+
+
+def _all_zalo_contact_rows_for_owner(
+    supabase, *, user_id_zl_main: str, max_rows: int = 20000
+) -> list[dict]:
+    owner = str(user_id_zl_main or "").strip()
+    if not owner:
+        return []
+    all_group_ids = _fetch_group_ids_by_owner(
+        supabase, owner_id_zl_main=owner, active_only=False
+    )
+    if not all_group_ids:
+        return []
+    return _fetch_zalo_contacts_by_id_groups(
+        supabase,
+        group_ids=all_group_ids,
+        limit=max_rows,
+        min_available_amount=None,
+    )
+
+
+def _contact_maps_for_payout(rows: list[dict]) -> tuple[dict[str, list[dict]], dict[int, dict]]:
+    by_id_from: dict[str, list[dict]] = {}
+    by_id: dict[int, dict] = {}
+    for row in rows:
+        if _is_admin_zalo_contact_role(row.get("role")):
+            continue
+        cid = row.get("id")
+        if cid is None:
+            continue
+        try:
+            cid_int = int(cid)
+        except (TypeError, ValueError):
+            continue
+        zid = str(row.get("id_from") or "").strip()
+        if not zid:
+            continue
+        by_id[cid_int] = row
+        by_id_from.setdefault(zid, []).append(row)
+    return by_id_from, by_id
+
+
+def _parse_amount_cell(v: object) -> float | None:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().replace(",", "").replace(" ", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _excel_cell_to_id_from(v: object) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    if isinstance(v, int):
+        return str(v)
+    return str(v).strip()
+
+
+def _resolve_payout_deduct_vnd(avail: float, amt_request: int) -> float | None:
+    """
+    So tien thuc te tru khoi available (float).
+    None = khong du. Cho phep lech nho (lam tron / float) giua file va DB, VD 8152.8 vs 8153.
+    """
+    a = float(avail or 0.0)
+    if amt_request <= a + 1e-6:
+        return float(amt_request)
+    if amt_request > a and (amt_request - a) <= _PAYOUT_FLOAT_VND_SLACK:
+        return a
+    return None
+
+
+def _floor_vnd_to_thousand(v: float) -> int:
+    """Lam trong xuong boi so 1.000 VND (don vi nghin). VD 5453 -> 5000."""
+    x = max(0.0, float(v or 0.0))
+    return int(math.floor(x / 1000.0 + 1e-9)) * 1000
+
+
+def _payout_preview_from_dataframe(
+    df: pd.DataFrame,
+    *,
+    by_id_from: dict[str, list[dict]],
+) -> tuple[list[dict], dict[str, int]]:
+    columns = [str(c).strip() for c in df.columns]
+    col_id = _pick_id_from_column(columns)
+    col_amt = _pick_amount_column(columns)
+    col_st = _pick_status_column(columns)
+    if not col_id and not col_amt:
+        raise HTTPException(
+            status_code=400,
+            detail="File thieu cot id_from (hoac Ma Zalo) va cot So tien chuyen",
+        )
+    if not col_id:
+        raise HTTPException(
+            status_code=400,
+            detail="File thieu cot id_from (hoac Ma Zalo)",
+        )
+    if not col_amt:
+        raise HTTPException(
+            status_code=400,
+            detail="File thieu cot So tien chuyen",
+        )
+    if not col_st:
+        raise HTTPException(
+            status_code=400,
+            detail="File thieu cot Hoan Tien chua (hoac Trang thai)",
+        )
+
+    out_rows: list[dict] = []
+    summary = {"matched": 0, "skipped": 0, "not_found": 0, "ambiguous": 0, "insufficient": 0, "bad_row": 0}
+
+    for i, row in df.iterrows():
+        sheet_row = int(i) + 2
+        id_from = _excel_cell_to_id_from(row.get(col_id))
+        amt = _parse_amount_cell(row.get(col_amt))
+        st_cell = row.get(col_st)
+
+        base: dict = {
+            "sheet_row": sheet_row,
+            "id_from": id_from or None,
+            "amount_file": None,
+            "status_raw": None if st_cell is None or (isinstance(st_cell, float) and pd.isna(st_cell)) else str(st_cell),
+            "result": "",
+            "message": None,
+            "contact_id": None,
+            "d_name_db": None,
+            "available_before": None,
+            "available_after": None,
+            "received_before": None,
+            "received_after": None,
+            "deduct_applied": None,
+        }
+
+        if not id_from:
+            if amt is None and (st_cell is None or (isinstance(st_cell, float) and pd.isna(st_cell))):
+                continue
+            base["result"] = "bad_row"
+            base["message"] = "Thieu id_from"
+            summary["bad_row"] += 1
+            out_rows.append(base)
+            continue
+
+        if amt is None or amt <= 0:
+            base["result"] = "bad_row"
+            base["message"] = "So tien chuyen khong hop le"
+            summary["bad_row"] += 1
+            out_rows.append(base)
+            continue
+
+        base["amount_file"] = int(round(amt))
+
+        if not _is_payout_paid_cell(st_cell):
+            base["result"] = "skipped"
+            base["message"] = "Khong phai Da Tra Hoa Hong — bo qua"
+            summary["skipped"] += 1
+            out_rows.append(base)
+            continue
+
+        matches = by_id_from.get(id_from, [])
+        if not matches:
+            base["result"] = "not_found"
+            base["message"] = "id_from khong thuoc danh sach cua ban"
+            summary["not_found"] += 1
+            out_rows.append(base)
+            continue
+        if len(matches) > 1:
+            base["result"] = "ambiguous"
+            base["message"] = "Trung id_from tren nhieu ban ghi — can xu ly thu cong"
+            summary["ambiguous"] += 1
+            out_rows.append(base)
+            continue
+
+        c = matches[0]
+        cid = int(c["id"])
+        avail = float(c.get("available_amount") or 0)
+        recv = float(c.get("received") or 0)
+        amt_i = int(round(amt))
+        deduct = _resolve_payout_deduct_vnd(avail, amt_i)
+        if deduct is None:
+            base["result"] = "insufficient"
+            base["message"] = f"available_amount ({avail}) < so tien ({amt_i})"
+            summary["insufficient"] += 1
+            out_rows.append(base)
+            continue
+
+        base["result"] = "matched"
+        base["contact_id"] = cid
+        base["d_name_db"] = str(c.get("d_name") or "").strip() or None
+        base["deduct_applied"] = round(deduct, 4)
+        if abs(float(amt_i) - deduct) > 1e-6:
+            base["message"] = (
+                f"So tien file {amt_i} VND; tru thuc te {round(deduct, 4)} VND (chenh lech float/lam tron <= {_PAYOUT_FLOAT_VND_SLACK} VND)"
+            )
+        base["available_before"] = round(avail, 4)
+        base["available_after"] = round(avail - deduct, 4)
+        recv_delta = int(round(float(deduct)))
+        base["received_before"] = round(recv, 4)
+        base["received_after"] = round(float(recv) + float(recv_delta), 4)
+        summary["matched"] += 1
+        out_rows.append(base)
+
+    return out_rows, summary
+
+
+class PayoutApplyItem(BaseModel):
+    contact_id: int = Field(..., gt=0)
+    amount_vnd: int = Field(..., gt=0)
+
+
+class PayoutApplyBody(BaseModel):
+    rows: list[PayoutApplyItem] = Field(..., min_length=1, max_length=500)
+
+
+@router.post("/zalo-contacts/payout-file/preview")
+async def preview_zalo_payout_import(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Doc Excel (dong dau = header): id_from, So tien chuyen, Hoan Tien chua = Da Tra Hoa Hong."""
+    try:
+        raw = await file.read()
+        if len(raw) > PAYOUT_IMPORT_MAX_BYTES:
+            raise HTTPException(status_code=400, detail="File qua lon (toi da 5MB)")
+        if not raw:
+            raise HTTPException(status_code=400, detail="File rong")
+
+        supabase = get_supabase_client()
+        user_id_zl_main = str(current_user.get("id_zl") or "").strip()
+        if not user_id_zl_main:
+            raise HTTPException(status_code=400, detail="Tai khoan khong co id_zl")
+
+        try:
+            df = pd.read_excel(BytesIO(raw), header=0, engine="openpyxl")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Khong doc duoc Excel: {exc}") from exc
+
+        contacts = _all_zalo_contact_rows_for_owner(supabase, user_id_zl_main=user_id_zl_main)
+        by_id_from, _by_id = _contact_maps_for_payout(contacts)
+        rows, summary = _payout_preview_from_dataframe(df, by_id_from=by_id_from)
+
+        apply_rows = [
+            {"contact_id": r["contact_id"], "amount_vnd": r["amount_file"]}
+            for r in rows
+            if r.get("result") == "matched" and r.get("contact_id") is not None and r.get("amount_file")
+        ]
+        return {"rows": rows, "summary": summary, "apply_rows": apply_rows}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Payout preview loi: {exc}",
+        ) from exc
+
+
+@router.post("/zalo-contacts/payout-file/apply")
+def apply_zalo_payout_import(
+    body: PayoutApplyBody,
+    current_user: dict = Depends(get_current_user),
+):
+    """Tru available_amount, cong received; chi contact thuoc owner; update co dieu kien du so du."""
+    try:
+        supabase = get_supabase_client()
+        user_id_zl_main = str(current_user.get("id_zl") or "").strip()
+        if not user_id_zl_main:
+            raise HTTPException(status_code=400, detail="Tai khoan khong co id_zl")
+
+        contacts = _all_zalo_contact_rows_for_owner(supabase, user_id_zl_main=user_id_zl_main)
+        _, by_id = _contact_maps_for_payout(contacts)
+
+        seen: set[int] = set()
+        for it in body.rows:
+            if it.contact_id in seen:
+                raise HTTPException(status_code=400, detail="Trung contact_id trong payload")
+            seen.add(it.contact_id)
+
+        applied: list[dict] = []
+        for it in body.rows:
+            row = by_id.get(it.contact_id)
+            if not row:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"contact_id={it.contact_id} khong ton tai hoac khong thuoc ban",
+                )
+            if _is_admin_zalo_contact_role(row.get("role")):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"contact_id={it.contact_id} khong duoc phep (ADMIN)",
+                )
+            amt = int(it.amount_vnd)
+            if amt <= 0:
+                raise HTTPException(status_code=400, detail="amount_vnd phai > 0")
+
+            snap = (
+                supabase.table("zalo_contacts")
+                .select("available_amount,received")
+                .eq("id", it.contact_id)
+                .limit(1)
+                .execute()
+            )
+            snap_rows = snap.data or []
+            if not snap_rows:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"contact_id={it.contact_id} khong doc duoc snapshot",
+                )
+            cur = snap_rows[0]
+            avail = float(cur.get("available_amount") or 0)
+            recv = float(cur.get("received") or 0)
+            deduct = _resolve_payout_deduct_vnd(avail, amt)
+            if deduct is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"contact_id={it.contact_id} id_from={row.get('id_from')} "
+                        f"khong du available_amount (con {avail}, can {amt})"
+                    ),
+                )
+
+            new_avail = round(avail - float(deduct), 4)
+            recv_delta = int(round(float(deduct)))
+            new_recv = int(round(float(recv) + float(recv_delta)))
+
+            res = (
+                supabase.table("zalo_contacts")
+                .update(
+                    {
+                        "available_amount": new_avail,
+                        "received": new_recv,
+                    }
+                )
+                .eq("id", it.contact_id)
+                .execute()
+            )
+            updated = res.data or []
+            if not updated:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Khong cap nhat duoc contact_id={it.contact_id} (so du da doi hoac bi khac xu ly)",
+                )
+            applied.append(
+                {
+                    "contact_id": it.contact_id,
+                    "id_from": str(row.get("id_from") or "").strip(),
+                    "amount_vnd": amt,
+                    "deduct_applied": round(float(deduct), 4),
+                    "available_after": new_avail,
+                    "received_after": new_recv,
+                }
+            )
+            row["available_amount"] = new_avail
+            row["received"] = new_recv
+
+        return {"applied_count": len(applied), "applied": applied}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Payout apply loi: {exc}",
         ) from exc
 
 
@@ -982,6 +1604,13 @@ def _analyze_import_rows(content: bytes, filename: str) -> dict:
             "matched_contact": 0,
             "matched_config": 0,
             "missing_config": 0,
+            "hoa_hong": {
+                "ok": False,
+                "value_1": 0.0,
+                "value_2": 0.0,
+                "value_3": 0.0,
+                "value_4": 0.0,
+            },
         }
 
     supabase = get_supabase_client()
@@ -1009,7 +1638,7 @@ def _analyze_import_rows(content: bytes, filename: str) -> dict:
             }
         )
         contact_map = _build_contact_map(supabase, zl_values)
-        config_rows = _build_commission_config_rows(supabase)
+        h1, h2, h3, h4, hoa_hong_ok = _fetch_hoa_hong_pct_quads(supabase)
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -1034,17 +1663,16 @@ def _analyze_import_rows(content: bytes, filename: str) -> dict:
         if not contact:
             continue
 
-        payout_pct = _pick_payout_pct(config_rows, group_id=group_id, id_from=zl)
-        if payout_pct is None:
-            missing_config += 1
-            payout_pct = 0
-        else:
+        if hoa_hong_ok:
             matched_config += 1
+        else:
+            missing_config += 1
 
         net_commission = float(row.get("net_affiliate_commission") or 0)
         row["id_zl"] = zl
         row["name"] = contact.get("name")
-        row["hh_user"] = round((net_commission * payout_pct) / 100, 4)
+        _, _, hh_u = _amounts_from_hoa_hong_net(net_commission, h1, h2, h3, h4)
+        row["hh_user"] = hh_u if hoa_hong_ok else 0.0
         matched_contact += 1
 
     order_id_list = [str(r.get("order_id") or "") for r in rows]
@@ -1077,6 +1705,13 @@ def _analyze_import_rows(content: bytes, filename: str) -> dict:
         "matched_contact": matched_contact,
         "matched_config": matched_config,
         "missing_config": missing_config,
+        "hoa_hong": {
+            "ok": hoa_hong_ok,
+            "value_1": h1,
+            "value_2": h2,
+            "value_3": h3,
+            "value_4": h4,
+        },
     }
 
 
@@ -1101,10 +1736,17 @@ def _build_import_preview_items(
     convert_info_map: dict[str, dict[str, str | None]],
     *,
     existing_by_order_id: dict[str, dict] | None = None,
+    hoa_hong: dict | None = None,
 ) -> list[dict]:
     out: list[dict] = []
     group_cache: dict[str, tuple[str | None, str | None]] = {}
     agency_ids_for_lookup: set[str] = set()
+    hh = hoa_hong or {}
+    v1 = float(hh.get("value_1") or 0)
+    v2 = float(hh.get("value_2") or 0)
+    v3 = float(hh.get("value_3") or 0)
+    v4 = float(hh.get("value_4") or 0)
+    hoa_ok = bool(hh.get("ok"))
     for row in rows_to_upsert:
         sub_id1 = str(row.get("sub_id1") or "").strip()
         convert_info = convert_info_map.get(sub_id1) if sub_id1 else None
@@ -1134,6 +1776,10 @@ def _build_import_preview_items(
         is_unchanged = (
             db_row is not None and _incoming_commission_row_equals_db(row, db_row)
         )
+        agency_amount, owner_amount, _hh_calc = _amounts_from_hoa_hong_net(net, v1, v2, v3, v4)
+        if not hoa_ok:
+            agency_amount = 0.0
+            owner_amount = 0.0
         out.append(
             {
                 "order_id": oid,
@@ -1148,8 +1794,8 @@ def _build_import_preview_items(
                 "agency_id_zl": agency_id_zl,
                 "agency_name": None,
                 "owner_id_zl_main": owner_id_zl_main,
-                "agency_amount": round((net * SPLIT_AGENCY_PCT) / 100.0, 4),
-                "owner_amount": round((net * SPLIT_OWNER_PCT) / 100.0, 4),
+                "agency_amount": agency_amount,
+                "owner_amount": owner_amount,
                 "split_issue": split_issue,
             }
         )
@@ -1219,6 +1865,7 @@ async def import_commission_report_preview(file: UploadFile = File(...)):
         analyzed["rows_to_upsert"],
         analyzed["convert_info_map"],
         existing_by_order_id=existing_map,
+        hoa_hong=analyzed.get("hoa_hong"),
     )
     preview_with_issue = sum(1 for item in preview_items if item.get("split_issue"))
     preview_counts = {
@@ -1251,6 +1898,7 @@ async def import_commission_report_preview(file: UploadFile = File(...)):
             ),
             "matched_commission_config": analyzed["matched_config"],
             "missing_commission_config": analyzed["missing_config"],
+            "hoa_hong": analyzed.get("hoa_hong"),
         },
     }
 
@@ -1335,6 +1983,7 @@ async def import_commission_report(file: UploadFile = File(...)):
                 "missing_zalo_contacts": max(matched_convert - matched_contact, 0),
                 "matched_commission_config": matched_config,
                 "missing_commission_config": missing_config,
+                "hoa_hong": analyzed.get("hoa_hong"),
             },
         }
 
@@ -1372,6 +2021,9 @@ async def import_commission_report(file: UploadFile = File(...)):
                 orders_from_db,
                 import_batch_id,
                 convert_info_map,
+                hoa_v1=float((analyzed.get("hoa_hong") or {}).get("value_1") or 0),
+                hoa_v2=float((analyzed.get("hoa_hong") or {}).get("value_2") or 0),
+                hoa_v4=float((analyzed.get("hoa_hong") or {}).get("value_4") or 0),
             )
         except HTTPException:
             raise
@@ -1398,5 +2050,6 @@ async def import_commission_report(file: UploadFile = File(...)):
             "missing_zalo_contacts": max(matched_convert - matched_contact, 0),
             "matched_commission_config": matched_config,
             "missing_commission_config": missing_config,
+            "hoa_hong": analyzed.get("hoa_hong"),
         },
     }
