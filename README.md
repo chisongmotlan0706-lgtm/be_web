@@ -84,14 +84,24 @@ Nhận cùng file như endpoint import nhưng **không ghi DB**. Trả `would_up
 
 ### `POST /commission-report/sync-hh-to-zalo`
 
-Gọi RPC `sync_commission_hh_to_zalo` trên Supabase (**một transaction**): các đơn `order_status = 'Hoàn thành'` có `id_zl` affiliate khớp `zalo_contacts.id_from` được cộng vào `zalo_contacts.available_amount` theo từng `id_from`:
+Gọi RPC `sync_commission_hh_to_zalo()` **không tham số** (mặc định `p_restrict_order_ids = NULL`): đồng bộ **tất cả** đơn `order_status = 'Hoàn thành'` đủ điều kiện (giữ hành vi cũ / nâng cao).
 
-- **`SUM(hh_user)`** trên các đơn đó (affiliate);
-- **cộng thêm** **`SUM(amount)`** từ `affiliate_commission_order_splits` gắn các đơn đó, **theo từng `id_zl` người nhận split**, chỉ khi `id_zl` đó cũng tồn tại trong `zalo_contacts` (nếu thiếu contact, phần split đó **không** được cộng nhưng đơn vẫn chuyển **Đã cộng tiền** nếu affiliate hợp lệ).
+### `POST /commission-report/sync-hh-to-zalo-bill-preview`
 
-Sau đó đổi `order_status` thành **`Đã cộng tiền`**, ghi `public.commission_payout_sync_log` (mỗi contact một dòng trong batch). Response: `sync_batch_id`, `orders_updated`, `orders_skipped_no_contact`, `contacts[]`, `total_amount_added`.
+Upload **Bill Conversion** Shopee (`.csv` / `.xlsx` / `.xls`). Parser: cột `ID đơn hàng`, `Trạng thái đặt hàng`; chỉ lấy các dòng **`Trạng thái đặt hàng = Hoàn thành`**, `order_id` unique. **Không ghi DB**. Trả `preview_items` (đối chiếu DB: có đơn, trạng thái, `id_zl`, có `zalo_contacts`, `eligible`, `skip_reason`, `hh_user`, `splits_total`) và các số đếm.
 
-Cần migration **`003`**, **`004`** (log + RPC), **`005`** (RLS log nếu cần), **`006`** (bảng splits), **`007_sync_commission_hh_to_zalo_splits.sql`** (RPC gộp splits). Cột `zalo_contacts.available_amount`.
+### `POST /commission-report/sync-hh-to-zalo-bill-apply`
+
+Cùng định dạng file; parse lại `order_id` rồi gọi RPC `sync_commission_hh_to_zalo(p_restrict_order_ids => …)` — chỉ đơn nằm trong danh sách **và** đủ điều kiện như RPC (DB `Hoàn thành`, có `id_zl`, có contact). Trả payload RPC + `source_filename`, `restrict_order_count`, `preview_eligible_count`.
+
+Chi tiết RPC (cộng `hh_user` + splits, ghi log, chỉ `UPDATE` trạng thái đơn thuộc tập **eligible** — xem migration **`007`** và **`018_sync_commission_hh_to_zalo_order_filter.sql`**):
+
+- **`SUM(hh_user)`** trên các đơn eligible (affiliate);
+- **cộng thêm** **`SUM(amount)`** từ `affiliate_commission_order_splits` gắn các đơn đó, **theo từng `id_zl` người nhận split**, chỉ khi `id_zl` đó cũng tồn tại trong `zalo_contacts`.
+
+Sau đó đổi `order_status` thành **`Đã cộng tiền`** (chỉ các đơn trong tập eligible), ghi `public.commission_payout_sync_log`. Response: `sync_batch_id`, `orders_updated`, `orders_skipped_no_contact`, `contacts[]`, `total_amount_added`.
+
+Cần migration **`003`**, **`004`**, **`005`**, **`006`**, **`007`**, **`018`**.
 
 ### `GET /commission-report/payout-sync-logs?limit=500&placed_within_days=7`
 
@@ -219,6 +229,7 @@ Chạy migration SQL một lần trong Supabase SQL Editor:
 - `supabase/migrations/005_commission_payout_sync_log_rls_fix.sql` (nếu lỗi RLS khi gọi RPC — `SECURITY DEFINER` + tắt RLS bảng log)
 - `supabase/migrations/006_affiliate_commission_order_splits.sql` (bảng `affiliate_commission_order_splits` — phân tầng sau import)
 - `supabase/migrations/007_sync_commission_hh_to_zalo_splits.sql` (RPC đồng bộ: `hh_user` + splits)
+- `supabase/migrations/018_sync_commission_hh_to_zalo_order_filter.sql` (RPC thêm `p_restrict_order_ids` — đồng bộ theo danh sách `order_id` từ file Bill Conversion)
 - `supabase/migrations/008_affiliate_commission_order_splits_rls_fix.sql` (tắt RLS bảng splits nếu Supabase chặn insert/select)
 - `supabase/migrations/009_zalo_groups_status.sql` (cột `status` cho nhóm — nếu chưa có)
 - `supabase/migrations/010_zalo_groups_rls_disable.sql` (tắt RLS `zalo_groups` nếu cần)

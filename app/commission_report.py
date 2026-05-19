@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 import unicodedata
 from typing import Any
@@ -42,10 +43,19 @@ COLUMN_GROUPS: dict[str, list[str]] = {
     "sub_id1": ["Sub_id1", "sub_id1"],
 }
 
+OPTIONAL_COLUMN_GROUPS: dict[str, list[str]] = {
+    "ten_sp": ["Tên Item", "Ten Item"],
+}
+
 
 def resolve_commission_columns(columns: list[str]) -> dict[str, str]:
     resolved: dict[str, str] = {}
     for key, candidates in COLUMN_GROUPS.items():
+        col = _resolve_column(columns, candidates)
+        if col:
+            resolved[key] = col
+
+    for key, candidates in OPTIONAL_COLUMN_GROUPS.items():
         col = _resolve_column(columns, candidates)
         if col:
             resolved[key] = col
@@ -85,6 +95,21 @@ def _first_nonempty(values: pd.Series) -> str | None:
         if text:
             return text
     return None
+
+
+def _join_ten_sp_json(values: pd.Series) -> str | None:
+    """Gop ten san pham cung order_id -> JSON array string (ten_sp)."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text or text.lower() == "nan" or text in seen:
+            continue
+        seen.add(text)
+        names.append(text)
+    if not names:
+        return None
+    return json.dumps(names, ensure_ascii=False)
 
 
 _VN_TZ = "Asia/Ho_Chi_Minh"
@@ -128,6 +153,11 @@ def aggregate_commission_rows(df: pd.DataFrame) -> list[dict[str, Any]]:
             "sub_id1": df[columns["sub_id1"]],
         }
     )
+    ten_sp_col = columns.get("ten_sp")
+    if ten_sp_col:
+        work["ten_sp_raw"] = df[ten_sp_col]
+    else:
+        work["ten_sp_raw"] = pd.Series([None] * len(work), index=work.index)
 
     work = work[work["order_id"] != ""]
     work = work[work["order_id"].str.lower() != "nan"]
@@ -156,6 +186,7 @@ def aggregate_commission_rows(df: pd.DataFrame) -> list[dict[str, Any]]:
                 "order_placed_at": group["order_placed_at"].min().isoformat(),
                 "net_affiliate_commission": float(group["net_commission"].sum()),
                 "sub_id1": _first_nonempty(group["sub_id1"]),
+                "ten_sp": _join_ten_sp_json(group["ten_sp_raw"]),
             }
         )
 
@@ -167,3 +198,65 @@ def parse_and_aggregate_report(content: bytes, filename: str) -> list[dict[str, 
     if df.empty:
         return []
     return aggregate_commission_rows(df)
+
+
+BILL_CONVERSION_COLUMN_GROUPS: dict[str, list[str]] = {
+    "order_id": ["ID đơn hàng"],
+    "order_status": ["Trạng thái đặt hàng"],
+}
+
+BILL_ORDER_STATUS_COMPLETED = "Hoàn thành"
+
+
+def resolve_bill_conversion_columns(columns: list[str]) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    for key, candidates in BILL_CONVERSION_COLUMN_GROUPS.items():
+        col = _resolve_column(columns, candidates)
+        if col:
+            resolved[key] = col
+    missing = [key for key in BILL_CONVERSION_COLUMN_GROUPS if key not in resolved]
+    if missing:
+        available = ", ".join(columns[:30])
+        if len(columns) > 30:
+            available += ", ..."
+        raise ValueError(
+            "File khong dung dinh dang Bill Conversion (Shopee). Thieu cot: "
+            + ", ".join(missing)
+            + f". Mot so cot: {available}"
+        )
+    return resolved
+
+
+def parse_bill_conversion_completed_order_ids(content: bytes, filename: str) -> dict[str, Any]:
+    """
+    Doc file Bill Conversion: lay order_id unique tu cac dong co Trang thai dat hang = Hoan thanh.
+    """
+    df = _read_dataframe(content, filename)
+    rows_total = int(len(df))
+    if df.empty:
+        return {
+            "order_ids": [],
+            "rows_completed_in_file": 0,
+            "rows_total_in_file": 0,
+            "unique_orders_completed": 0,
+        }
+    cols = resolve_bill_conversion_columns(list(df.columns))
+    oid_col = cols["order_id"]
+    st_col = cols["order_status"]
+    work = pd.DataFrame(
+        {
+            "order_id": df[oid_col].astype(str).str.strip(),
+            "order_status": df[st_col].astype(str).str.strip(),
+        }
+    )
+    work = work[work["order_id"] != ""]
+    work = work[work["order_id"].str.lower() != "nan"]
+    work = work[work["order_status"] == BILL_ORDER_STATUS_COMPLETED]
+    rows_completed = int(len(work))
+    unique_ids = sorted({str(x).strip() for x in work["order_id"].unique() if str(x).strip()})
+    return {
+        "order_ids": unique_ids,
+        "rows_completed_in_file": rows_completed,
+        "rows_total_in_file": rows_total,
+        "unique_orders_completed": len(unique_ids),
+    }

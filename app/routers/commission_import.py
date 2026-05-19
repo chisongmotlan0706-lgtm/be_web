@@ -14,7 +14,10 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from app.auth import get_current_user
-from app.commission_report import parse_and_aggregate_report
+from app.commission_report import (
+    parse_and_aggregate_report,
+    parse_bill_conversion_completed_order_ids,
+)
 from app.db import get_supabase_client
 from pydantic import BaseModel, Field
 
@@ -27,6 +30,7 @@ _PAYOUT_FLOAT_VND_SLACK = 0.51
 UPSERT_CHUNK = 500
 LOOKUP_CHUNK = 500
 PLACED_WITHIN_DAYS_ALLOWED = frozenset({1, 3, 7, 14})
+ORDER_STATUS_COMPLETED_SYNC = "Hoàn thành"
 ORDER_STATUS_PAID_SYNCED = "Đã cộng tiền"
 _VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
@@ -272,6 +276,166 @@ def _fetch_orders_map_by_order_id(supabase, order_ids: list[str]) -> dict[str, d
     return out
 
 
+def _fetch_splits_detail_by_commission_order_ids(
+    supabase, commission_ids: list[str]
+) -> dict[str, dict[str, dict[str, str | float] | None]]:
+    """
+    commission_order_id -> { agency: {id_zl, amount} | None, owner: {id_zl, amount} | None }
+    """
+    out: dict[str, dict[str, dict[str, str | float] | None]] = {}
+    unique = sorted({str(x).strip() for x in commission_ids if str(x).strip()})
+    for chunk in _chunked(unique, LOOKUP_CHUNK):
+        result = (
+            supabase.table(SPLIT_TABLE)
+            .select("commission_order_id,split_role,id_zl,amount")
+            .in_("commission_order_id", chunk)
+            .execute()
+        )
+        for item in result.data or []:
+            cid = str(item.get("commission_order_id") or "").strip()
+            if not cid:
+                continue
+            if cid not in out:
+                out[cid] = {"agency": None, "owner": None}
+            role = str(item.get("split_role") or "").strip()
+            entry: dict[str, str | float] = {
+                "id_zl": str(item.get("id_zl") or "").strip(),
+                "amount": round(float(item.get("amount") or 0), 4),
+            }
+            if role == SPLIT_ROLE_AGENCY:
+                out[cid]["agency"] = entry
+            elif role == SPLIT_ROLE_PLATFORM_OWNER:
+                out[cid]["owner"] = entry
+    return out
+
+
+def _contact_display_name(contact_map: dict[str, dict], id_zl: str | None) -> str | None:
+    if not id_zl:
+        return None
+    info = contact_map.get(str(id_zl).strip())
+    if not info:
+        return None
+    name = info.get("name")
+    if name is not None and str(name).strip():
+        return str(name).strip()
+    return None
+
+
+def _build_bill_sync_hh_preview(supabase, order_ids: list[str]) -> list[dict]:
+    """order_ids: thu tu hien thi nhu file (unique)."""
+    if not order_ids:
+        return []
+    db_map = _fetch_orders_map_by_order_id(supabase, order_ids)
+    commission_ids: list[str] = []
+    id_zls: list[str] = []
+    for oid in order_ids:
+        row = db_map.get(oid)
+        if not row:
+            continue
+        raw_id = row.get("id")
+        if raw_id is not None:
+            commission_ids.append(str(raw_id))
+        zl = str(row.get("id_zl") or "").strip()
+        if zl:
+            id_zls.append(zl)
+    split_detail = _fetch_splits_detail_by_commission_order_ids(supabase, commission_ids)
+    for detail in split_detail.values():
+        for role_key in ("agency", "owner"):
+            part = detail.get(role_key)
+            if part and part.get("id_zl"):
+                id_zls.append(str(part["id_zl"]).strip())
+    contact_map = _build_contact_map(supabase, sorted(set(id_zls)))
+
+    empty_payout = {
+        "user_name": None,
+        "user_amount": 0.0,
+        "agency_name": None,
+        "agency_amount": 0.0,
+        "owner_name": None,
+        "owner_amount": 0.0,
+    }
+
+    out: list[dict] = []
+    for oid in order_ids:
+        row = db_map.get(oid)
+        if not row:
+            out.append(
+                {
+                    "order_id": oid,
+                    "db_found": False,
+                    "db_order_status": None,
+                    "id_zl": None,
+                    "has_zalo_contact": False,
+                    "eligible": False,
+                    "skip_reason": "Khong co trong DB (chua import)",
+                    **empty_payout,
+                }
+            )
+            continue
+
+        db_st = str(row.get("order_status") or "").strip()
+        id_zl = str(row.get("id_zl") or "").strip() or None
+        has_contact = bool(id_zl and id_zl in contact_map)
+        cid = str(row.get("id") or "").strip()
+        hh_user = round(float(row.get("hh_user") or 0), 4)
+
+        skip_reason: str | None = None
+        eligible = False
+        if db_st == ORDER_STATUS_PAID_SYNCED:
+            skip_reason = "Da cong tien trong DB"
+        elif db_st != ORDER_STATUS_COMPLETED_SYNC:
+            skip_reason = f"Trang thai DB khac Hoan thanh ({db_st or 'rong'})"
+        elif not id_zl:
+            skip_reason = "Thieu id_zl (affiliate)"
+        elif not has_contact:
+            skip_reason = "Khong co zalo_contacts theo id_zl"
+        else:
+            eligible = True
+
+        user_name = _contact_display_name(contact_map, id_zl)
+        if not user_name and row.get("name"):
+            user_name = str(row.get("name") or "").strip() or None
+        user_amount = hh_user if eligible else 0.0
+
+        agency_name: str | None = None
+        agency_amount = 0.0
+        owner_name: str | None = None
+        owner_amount = 0.0
+        if cid:
+            parts = split_detail.get(cid) or {}
+            agency_part = parts.get("agency")
+            if agency_part:
+                agency_zl = str(agency_part.get("id_zl") or "").strip()
+                agency_name = _contact_display_name(contact_map, agency_zl)
+                if agency_zl and agency_zl in contact_map and eligible:
+                    agency_amount = float(agency_part.get("amount") or 0)
+            owner_part = parts.get("owner")
+            if owner_part:
+                owner_zl = str(owner_part.get("id_zl") or "").strip()
+                owner_name = _contact_display_name(contact_map, owner_zl)
+                if owner_zl and owner_zl in contact_map and eligible:
+                    owner_amount = float(owner_part.get("amount") or 0)
+
+        out.append(
+            {
+                "order_id": oid,
+                "db_found": True,
+                "db_order_status": db_st,
+                "id_zl": id_zl,
+                "has_zalo_contact": has_contact,
+                "eligible": eligible,
+                "skip_reason": skip_reason,
+                "user_name": user_name,
+                "user_amount": round(user_amount, 4),
+                "agency_name": agency_name,
+                "agency_amount": round(agency_amount, 4),
+                "owner_name": owner_name,
+                "owner_amount": round(owner_amount, 4),
+            }
+        )
+    return out
+
+
 def _fetch_orders_for_summary(
     supabase,
     *,
@@ -485,7 +649,8 @@ def _fetch_zalo_contacts_by_id_groups(
     limit: int,
     min_available_amount: float | None = None,
 ) -> list[dict]:
-    if limit <= 0:
+    """limit > 0: cat sau sort updated_at. limit = 0: lay het (de sort khac o buoc enrich)."""
+    if limit < 0:
         return []
     unique_groups = sorted({str(g or "").strip() for g in group_ids if str(g or "").strip()})
     if not unique_groups:
@@ -512,7 +677,9 @@ def _fetch_zalo_contacts_by_id_groups(
         key=lambda item: str(item.get("updated_at") or ""),
         reverse=True,
     )
-    return out[:limit]
+    if limit > 0:
+        return out[:limit]
+    return out
 
 
 def _fetch_order_balance_maps_by_id_zl(
@@ -864,6 +1031,7 @@ def _enriched_zalo_contacts_for_owner(
     user_id_zl_main: str,
     limit: int,
     min_available_amount: float | None,
+    sort_by: str = "updated_at",
 ) -> list[dict]:
     owner = str(user_id_zl_main or "").strip()
     if not owner:
@@ -893,10 +1061,12 @@ def _enriched_zalo_contacts_for_owner(
     split_pending_map, split_completed_map = _fetch_split_balance_maps_by_id_zl(
         supabase, active_member_id_zl
     )
+    sort_key = str(sort_by or "updated_at").strip().lower()
+    fetch_cap = 0 if sort_key == "tien_co_the_rut" else limit
     items = _fetch_zalo_contacts_by_id_groups(
         supabase,
         group_ids=all_group_ids,
-        limit=limit,
+        limit=fetch_cap,
         min_available_amount=min_available_amount,
     )
     items = [it for it in items if not _is_admin_zalo_contact_role(it.get("role"))]
@@ -910,6 +1080,10 @@ def _enriched_zalo_contacts_for_owner(
         item["cho_duyet"] = round(order_completed + split_completed, 4)
         item["tien_co_the_rut"] = float(_floor_vnd_to_thousand(float(item.get("available_amount") or 0)))
         item["da_rut_ve_bank"] = round(float(item.get("received") or 0), 4)
+    if sort_key == "tien_co_the_rut":
+        items.sort(key=lambda x: float(x.get("tien_co_the_rut") or 0), reverse=True)
+    if limit > 0:
+        items = items[:limit]
     return items
 
 
@@ -972,20 +1146,40 @@ def _zalo_contacts_transfer_workbook(items: list[dict], *, noi_dung_template: st
 @router.get("/zalo-contacts")
 def list_zalo_contacts(
     limit: int = Query(default=500, ge=1, le=2000),
+    apply_min_filter: bool = Query(
+        default=True,
+        description="True: chi contact co available_amount >= chuyen_tien.value_1 (neu co cau hinh).",
+    ),
+    sort_by: str = Query(
+        default="updated_at",
+        description="updated_at | tien_co_the_rut",
+    ),
     current_user: dict = Depends(get_current_user),
 ):
+    sort_norm = str(sort_by or "updated_at").strip().lower()
+    if sort_norm not in ("updated_at", "tien_co_the_rut"):
+        raise HTTPException(
+            status_code=400,
+            detail="sort_by chi chap nhan updated_at hoac tien_co_the_rut",
+        )
     try:
         supabase = get_supabase_client()
         user_id_zl_main = str(current_user.get("id_zl") or "").strip()
         min_vnd, _tpl = _fetch_chuyen_tien_settings(supabase)
-        min_arg = min_vnd if min_vnd > 0 else None
+        min_arg = None
+        if apply_min_filter and min_vnd > 0:
+            min_arg = min_vnd
         items = _enriched_zalo_contacts_for_owner(
             supabase,
             user_id_zl_main=user_id_zl_main,
             limit=limit,
             min_available_amount=min_arg,
+            sort_by=sort_norm,
         )
-        filters: dict[str, float | None] = {}
+        filters: dict[str, float | str | bool | None] = {
+            "apply_min_filter": apply_min_filter,
+            "sort_by": sort_norm,
+        }
         if min_vnd > 0:
             filters["min_available_vnd_chuyen_tien"] = round(min_vnd, 4)
         else:
@@ -1809,11 +2003,118 @@ def _build_import_preview_items(
     return out
 
 
+@router.post("/sync-hh-to-zalo-bill-preview")
+async def sync_hh_to_zalo_bill_preview(file: UploadFile = File(...)):
+    """
+    Doc file Bill Conversion (Shopee): don co Trang thai dat hang = Hoan thanh trong file.
+    Tra ve preview doi chieu DB (khong ghi DB).
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Thieu ten file")
+    suffix = file.filename.lower()
+    if not (suffix.endswith(".csv") or suffix.endswith(".xlsx") or suffix.endswith(".xls")):
+        raise HTTPException(status_code=400, detail="Chi ho tro file .csv, .xlsx hoac .xls")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="File rong")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File vuot qua 15MB")
+
+    try:
+        parsed = parse_bill_conversion_completed_order_ids(content, file.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Doc file loi: {exc}") from exc
+
+    order_ids: list[str] = parsed["order_ids"]
+    supabase = get_supabase_client()
+    preview_items = _build_bill_sync_hh_preview(supabase, order_ids)
+    eligible_n = sum(1 for it in preview_items if it.get("eligible"))
+    return {
+        "ok": True,
+        "source_filename": file.filename,
+        "rows_total_in_file": parsed["rows_total_in_file"],
+        "rows_completed_in_file": parsed["rows_completed_in_file"],
+        "unique_orders_completed": parsed["unique_orders_completed"],
+        "preview_eligible_count": eligible_n,
+        "preview_skip_count": len(preview_items) - eligible_n,
+        "preview_items": preview_items,
+    }
+
+
+@router.post("/sync-hh-to-zalo-bill-apply")
+async def sync_hh_to_zalo_bill_apply(file: UploadFile = File(...)):
+    """
+    Cung dinh dang file nhu preview: parse lai order_id Hoan thanh, goi RPC chi dong bo cac don do.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Thieu ten file")
+    suffix = file.filename.lower()
+    if not (suffix.endswith(".csv") or suffix.endswith(".xlsx") or suffix.endswith(".xls")):
+        raise HTTPException(status_code=400, detail="Chi ho tro file .csv, .xlsx hoac .xls")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="File rong")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File vuot qua 15MB")
+
+    try:
+        parsed = parse_bill_conversion_completed_order_ids(content, file.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Doc file loi: {exc}") from exc
+
+    order_ids: list[str] = parsed["order_ids"]
+    if not order_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="File khong co dong Trang thai dat hang = Hoan thanh hop le",
+        )
+
+    supabase = get_supabase_client()
+    preview_items = _build_bill_sync_hh_preview(supabase, order_ids)
+    eligible_n = sum(1 for it in preview_items if it.get("eligible"))
+    if eligible_n == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Khong co don nao du dieu kien dong bo (DB Hoan thanh + id_zl + zalo_contacts)",
+        )
+
+    try:
+        result = supabase.rpc(
+            "sync_commission_hh_to_zalo",
+            {"p_restrict_order_ids": order_ids},
+        ).execute()
+    except Exception as exc:
+        logger.exception("[commission-sync] RPC bill apply failed")
+        raise HTTPException(status_code=500, detail=f"RPC loi: {exc}") from exc
+
+    payload = _unwrap_rpc_jsonb(result)
+    if not payload:
+        raise HTTPException(status_code=500, detail="RPC tra ve rong")
+    logger.info(
+        "[commission-sync-bill] orders_updated=%s skipped=%s total=%s file=%s",
+        payload.get("orders_updated"),
+        payload.get("orders_skipped_no_contact"),
+        payload.get("total_amount_added"),
+        file.filename,
+    )
+    return {
+        **payload,
+        "source_filename": file.filename,
+        "restrict_order_count": len(order_ids),
+        "preview_eligible_count": eligible_n,
+    }
+
+
 @router.post("/sync-hh-to-zalo")
 def sync_hh_to_zalo():
     """
-    Goi RPC sync_commission_hh_to_zalo: cong HH user don Hoan thanh vao zalo_contacts.available_amount,
-    doi trang thai don sang Da cong tien (mot transaction tren Supabase).
+    Goi RPC sync_commission_hh_to_zalo (khong loc order_id): tat ca don Hoan thanh du dieu kien.
     """
     try:
         supabase = get_supabase_client()
