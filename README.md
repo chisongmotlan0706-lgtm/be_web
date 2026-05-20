@@ -184,6 +184,22 @@ Cập nhật theo `id`.
 
 Xóa cứng theo `id`.
 
+### `GET /bot-group?limit=200`
+
+Đọc `public.bot_group`, sắp xếp `priority` tăng dần rồi `id` (gồm `max_rep`, `current_rep` nếu đã migration **`022`**).
+
+### `POST /bot-group`
+
+Tạo dòng: JSON `name_bot` (nullable), `type_bot` (`REP` | `GHI`), `priority` (1–100), `max_rep` (optional, bigint hoặc null). **`id_bot` do server sinh** — chuỗi số ngẫu nhiên đúng **16 ký tự**; `current_rep` = `null` khi tạo.
+
+### `PUT /bot-group/{id}`
+
+Cập nhật `name_bot`, `type_bot`, `priority`, `max_rep` — **không** cập nhật `id_bot` hay `current_rep`.
+
+### `DELETE /bot-group/{id}`
+
+Xóa cứng theo `id`. Migration: **`021_bot_group.sql`** + **`022_bot_group_max_rep_current_rep.sql`** (cột `max_rep`, `current_rep`).
+
 **Form-data**
 
 - `file`: file báo cáo.

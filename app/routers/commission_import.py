@@ -41,6 +41,8 @@ CONFIG_KEY_CHUYEN_TIEN = "chuyen_tien"
 CONFIG_KEY_HOA_HONG = "hoa_hong"
 _DEFAULT_NOI_DUNG_TEMPLATE = "Ho tro hoa hong {id_from}"
 PAYOUT_STATUS_PAID = "Đã Trả Hoa Hồng"
+WITHDRAW_STATUS_CHUA_BAO_KHACH = "CHUA_BAO_KHACH"
+STATUS_BANK_LOI = "LOI_BANK"
 
 
 def _placed_within_vn_calendar_to_now(days: int) -> tuple[datetime, datetime]:
@@ -662,7 +664,7 @@ def _fetch_zalo_contacts_by_id_groups(
             supabase.table("zalo_contacts")
             .select(
                 "id,id_from,d_name,id_group,available_amount,actual_amount,estimated_amount,"
-                "role,bank_name,stk,updated_at,received"
+                "role,bank_name,bank_type,stk,status_bank,updated_at,received"
             )
             .in_("id_group", chunk)
         )
@@ -1032,6 +1034,7 @@ def _enriched_zalo_contacts_for_owner(
     limit: int,
     min_available_amount: float | None,
     sort_by: str = "updated_at",
+    include_admin: bool = False,
 ) -> list[dict]:
     owner = str(user_id_zl_main or "").strip()
     if not owner:
@@ -1069,7 +1072,8 @@ def _enriched_zalo_contacts_for_owner(
         limit=fetch_cap,
         min_available_amount=min_available_amount,
     )
-    items = [it for it in items if not _is_admin_zalo_contact_role(it.get("role"))]
+    if not include_admin:
+        items = [it for it in items if not _is_admin_zalo_contact_role(it.get("role"))]
     for item in items:
         id_from = str(item.get("id_from") or "").strip()
         order_pending = order_pending_map.get(id_from, 0.0)
@@ -1088,7 +1092,7 @@ def _enriched_zalo_contacts_for_owner(
 
 
 def _zalo_contacts_transfer_workbook(items: list[dict], *, noi_dung_template: str) -> BytesIO:
-    """Export: STT, id_from, id_group, so tien, TK, ten, NH, noi dung, cot trang thai (de dien sau CK)."""
+    """Export CK: cot ngan hang = zalo_contacts.bank_type (khong dung bank_name)."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Chuyen tien"
@@ -1100,7 +1104,7 @@ def _zalo_contacts_transfer_workbook(items: list[dict], *, noi_dung_template: st
         "Số tiền chuyển",
         "TK hưởng",
         "Tên người hưởng",
-        "Tên ngân hàng",
+        "bank_type",
         "Nội dung",
         "Hoàn Tiền chưa",
     ]
@@ -1115,7 +1119,7 @@ def _zalo_contacts_transfer_workbook(items: list[dict], *, noi_dung_template: st
         id_from = str(item.get("id_from") or "").strip()
         id_group = str(item.get("id_group") or "").strip()
         d_name = str(item.get("d_name") or "").strip()
-        bank = str(item.get("bank_name") or "").strip()
+        bank = str(item.get("bank_type") or "").strip()
         stk_raw = str(item.get("stk") or "").strip()
         amt = _floor_vnd_to_thousand(float(item.get("available_amount") or 0))
         noi = _format_noi_dung_ck(noi_dung_template, id_from=id_from, d_name=d_name)
@@ -1150,6 +1154,10 @@ def list_zalo_contacts(
         default=True,
         description="True: chi contact co available_amount >= chuyen_tien.value_1 (neu co cau hinh).",
     ),
+    include_admin: bool = Query(
+        default=False,
+        description="True: gom ca contact role ADMIN (mac dinh an ADMIN).",
+    ),
     sort_by: str = Query(
         default="updated_at",
         description="updated_at | tien_co_the_rut",
@@ -1175,9 +1183,11 @@ def list_zalo_contacts(
             limit=limit,
             min_available_amount=min_arg,
             sort_by=sort_norm,
+            include_admin=include_admin,
         )
         filters: dict[str, float | str | bool | None] = {
             "apply_min_filter": apply_min_filter,
+            "include_admin": include_admin,
             "sort_by": sort_norm,
         }
         if min_vnd > 0:
@@ -1192,9 +1202,72 @@ def list_zalo_contacts(
         ) from exc
 
 
+def _contact_row_owned_by_user(
+    supabase,
+    *,
+    contact_id: int,
+    user_id_zl_main: str,
+) -> dict:
+    owner = str(user_id_zl_main or "").strip()
+    if not owner:
+        raise HTTPException(status_code=400, detail="Tai khoan khong co id_zl")
+    contacts = _all_zalo_contact_rows_for_owner(supabase, user_id_zl_main=owner)
+    _, by_id = _contact_maps_for_payout(contacts)
+    row = by_id.get(contact_id)
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"contact_id={contact_id} khong ton tai hoac khong thuoc ban",
+        )
+    return row
+
+
+@router.patch("/zalo-contacts/{contact_id}/status-bank")
+def mark_zalo_contact_loi_bank(
+    contact_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Danh dau contact LOI_BANK (status_bank = LOI_BANK), chi contact thuoc nhom cua user."""
+    try:
+        supabase = get_supabase_client()
+        user_id_zl_main = str(current_user.get("id_zl") or "").strip()
+        _contact_row_owned_by_user(
+            supabase, contact_id=contact_id, user_id_zl_main=user_id_zl_main
+        )
+        res = (
+            supabase.table("zalo_contacts")
+            .update({"status_bank": STATUS_BANK_LOI})
+            .eq("id", contact_id)
+            .execute()
+        )
+        updated = res.data or []
+        if not updated:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Khong cap nhat duoc contact_id={contact_id}",
+            )
+        row = updated[0]
+        return {
+            "contact_id": contact_id,
+            "id_from": str(row.get("id_from") or "").strip(),
+            "status_bank": str(row.get("status_bank") or STATUS_BANK_LOI),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Cap nhat status_bank loi: {exc}",
+        ) from exc
+
+
 @router.get("/zalo-contacts/export")
 def export_zalo_contacts_xlsx(
     limit: int = Query(default=2000, ge=1, le=5000),
+    include_admin: bool = Query(
+        default=False,
+        description="True: gom ca contact role ADMIN trong file xuat.",
+    ),
     current_user: dict = Depends(get_current_user),
 ):
     try:
@@ -1207,6 +1280,7 @@ def export_zalo_contacts_xlsx(
             user_id_zl_main=user_id_zl_main,
             limit=limit,
             min_available_amount=min_arg,
+            include_admin=include_admin,
         )
         bio = _zalo_contacts_transfer_workbook(items, noi_dung_template=noi_tpl)
         data = bio.getvalue()
@@ -1282,12 +1356,60 @@ def _all_zalo_contact_rows_for_owner(
     )
 
 
+def _payout_deduct_vnd_for_contact(*, avail: float, amount_vnd: int) -> float | None:
+    """So tien tru available va cong received — theo cot So tien chuyen trong file Excel."""
+    return _resolve_payout_deduct_vnd(avail, amount_vnd)
+
+
+def _payout_withdraw_eligible(row: dict) -> tuple[bool, str | None]:
+    if not _withdraw_bank_fields_from_contact(row):
+        return False, "thieu bank_type, stk hoac bank_name"
+    return True, None
+
+
+def _withdraw_bank_fields_from_contact(row: dict) -> tuple[str, str, str] | None:
+    bank_type = str(row.get("bank_type") or "").strip()
+    stk = str(row.get("stk") or "").strip()
+    bank_name = str(row.get("bank_name") or "").strip()
+    if not bank_type or not stk or not bank_name:
+        return None
+    return bank_type, stk, bank_name
+
+
+def _insert_withdraw_request_chua_bao_khach(
+    supabase,
+    *,
+    id_from: str,
+    d_name: str | None,
+    amount_vnd: int,
+    bank_type: str,
+    stk: str,
+    bank_name: str,
+) -> str:
+    if amount_vnd <= 0:
+        raise HTTPException(status_code=400, detail="amount withdraw_requests phai > 0")
+    payload = {
+        "id_from": id_from,
+        "d_name": d_name,
+        "amount": amount_vnd,
+        "bank_type": bank_type,
+        "stk": stk,
+        "bank_name": bank_name,
+        "status": WITHDRAW_STATUS_CHUA_BAO_KHACH,
+        "note": "zalo-contacts payout-file apply",
+    }
+    res = supabase.table("withdraw_requests").insert(payload).execute()
+    rows = res.data or []
+    if not rows:
+        raise HTTPException(status_code=500, detail="Khong tao duoc withdraw_requests")
+    wid = rows[0].get("id")
+    return str(wid) if wid is not None else ""
+
+
 def _contact_maps_for_payout(rows: list[dict]) -> tuple[dict[str, list[dict]], dict[int, dict]]:
     by_id_from: dict[str, list[dict]] = {}
     by_id: dict[int, dict] = {}
     for row in rows:
-        if _is_admin_zalo_contact_role(row.get("role")):
-            continue
         cid = row.get("id")
         if cid is None:
             continue
@@ -1377,7 +1499,15 @@ def _payout_preview_from_dataframe(
         )
 
     out_rows: list[dict] = []
-    summary = {"matched": 0, "skipped": 0, "not_found": 0, "ambiguous": 0, "insufficient": 0, "bad_row": 0}
+    summary = {
+        "matched": 0,
+        "skipped": 0,
+        "not_found": 0,
+        "ambiguous": 0,
+        "insufficient": 0,
+        "bad_row": 0,
+        "withdraw_blocked": 0,
+    }
 
     for i, row in df.iterrows():
         sheet_row = int(i) + 2
@@ -1399,6 +1529,7 @@ def _payout_preview_from_dataframe(
             "received_before": None,
             "received_after": None,
             "deduct_applied": None,
+            "is_admin": False,
         }
 
         if not id_from:
@@ -1409,15 +1540,6 @@ def _payout_preview_from_dataframe(
             summary["bad_row"] += 1
             out_rows.append(base)
             continue
-
-        if amt is None or amt <= 0:
-            base["result"] = "bad_row"
-            base["message"] = "So tien chuyen khong hop le"
-            summary["bad_row"] += 1
-            out_rows.append(base)
-            continue
-
-        base["amount_file"] = int(round(amt))
 
         if not _is_payout_paid_cell(st_cell):
             base["result"] = "skipped"
@@ -1444,11 +1566,20 @@ def _payout_preview_from_dataframe(
         cid = int(c["id"])
         avail = float(c.get("available_amount") or 0)
         recv = float(c.get("received") or 0)
+        base["is_admin"] = _is_admin_zalo_contact_role(c.get("role"))
+
+        if amt is None or amt <= 0:
+            base["result"] = "bad_row"
+            base["message"] = "So tien chuyen khong hop le"
+            summary["bad_row"] += 1
+            out_rows.append(base)
+            continue
+        base["amount_file"] = int(round(amt))
         amt_i = int(round(amt))
-        deduct = _resolve_payout_deduct_vnd(avail, amt_i)
+        deduct = _payout_deduct_vnd_for_contact(avail=avail, amount_vnd=amt_i)
         if deduct is None:
             base["result"] = "insufficient"
-            base["message"] = f"available_amount ({avail}) < so tien ({amt_i})"
+            base["message"] = f"available_amount ({avail}) < so tien chuyen ({amt_i})"
             summary["insufficient"] += 1
             out_rows.append(base)
             continue
@@ -1457,16 +1588,32 @@ def _payout_preview_from_dataframe(
         base["contact_id"] = cid
         base["d_name_db"] = str(c.get("d_name") or "").strip() or None
         base["deduct_applied"] = round(deduct, 4)
+        base["message"] = (
+            f"received += So tien chuyen {amt_i} VND "
+            f"(available {round(avail, 4)} -> {round(avail - deduct, 4)})"
+        )
         if abs(float(amt_i) - deduct) > 1e-6:
-            base["message"] = (
-                f"So tien file {amt_i} VND; tru thuc te {round(deduct, 4)} VND (chenh lech float/lam tron <= {_PAYOUT_FLOAT_VND_SLACK} VND)"
+            base["message"] += (
+                f"; tru thuc te {round(deduct, 4)} VND "
+                f"(chenh lech float/lam tron <= {_PAYOUT_FLOAT_VND_SLACK} VND)"
             )
         base["available_before"] = round(avail, 4)
         base["available_after"] = round(avail - deduct, 4)
         recv_delta = int(round(float(deduct)))
         base["received_before"] = round(recv, 4)
         base["received_after"] = round(float(recv) + float(recv_delta), 4)
-        summary["matched"] += 1
+        amount_apply = int(round(float(deduct)))
+        elig, block = _payout_withdraw_eligible(c)
+        if not elig:
+            base["result"] = "withdraw_blocked"
+            prev = base.get("message") or "So du hop le"
+            base["message"] = f"{prev}; khong chot duoc: {block}"
+            summary["withdraw_blocked"] += 1
+        else:
+            prev = base.get("message")
+            suffix = "; + withdraw_requests CHUA_BAO_KHACH khi chot"
+            base["message"] = (prev + suffix) if prev else suffix.strip("; ")
+            summary["matched"] += 1
         out_rows.append(base)
 
     return out_rows, summary
@@ -1509,9 +1656,15 @@ async def preview_zalo_payout_import(
         rows, summary = _payout_preview_from_dataframe(df, by_id_from=by_id_from)
 
         apply_rows = [
-            {"contact_id": r["contact_id"], "amount_vnd": r["amount_file"]}
+            {
+                "contact_id": r["contact_id"],
+                "amount_vnd": int(round(float(r["deduct_applied"]))),
+            }
             for r in rows
-            if r.get("result") == "matched" and r.get("contact_id") is not None and r.get("amount_file")
+            if r.get("result") == "matched"
+            and r.get("contact_id") is not None
+            and r.get("deduct_applied") is not None
+            and float(r["deduct_applied"]) > 0
         ]
         return {"rows": rows, "summary": summary, "apply_rows": apply_rows}
     except HTTPException:
@@ -1528,7 +1681,7 @@ def apply_zalo_payout_import(
     body: PayoutApplyBody,
     current_user: dict = Depends(get_current_user),
 ):
-    """Tru available_amount, cong received; chi contact thuoc owner; update co dieu kien du so du."""
+    """Tru available_amount, cong received; ghi withdraw_requests status CHUA_BAO_KHACH."""
     try:
         supabase = get_supabase_client()
         user_id_zl_main = str(current_user.get("id_zl") or "").strip()
@@ -1552,11 +1705,6 @@ def apply_zalo_payout_import(
                     status_code=400,
                     detail=f"contact_id={it.contact_id} khong ton tai hoac khong thuoc ban",
                 )
-            if _is_admin_zalo_contact_role(row.get("role")):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"contact_id={it.contact_id} khong duoc phep (ADMIN)",
-                )
             amt = int(it.amount_vnd)
             if amt <= 0:
                 raise HTTPException(status_code=400, detail="amount_vnd phai > 0")
@@ -1577,14 +1725,35 @@ def apply_zalo_payout_import(
             cur = snap_rows[0]
             avail = float(cur.get("available_amount") or 0)
             recv = float(cur.get("received") or 0)
-            deduct = _resolve_payout_deduct_vnd(avail, amt)
+            is_admin = _is_admin_zalo_contact_role(row.get("role"))
+            deduct = _payout_deduct_vnd_for_contact(avail=avail, amount_vnd=amt)
             if deduct is None:
                 raise HTTPException(
                     status_code=400,
                     detail=(
                         f"contact_id={it.contact_id} id_from={row.get('id_from')} "
-                        f"khong du available_amount (con {avail}, can {amt})"
+                        f"khong du available_amount (con {avail}, can So tien chuyen {amt})"
                     ),
+                )
+
+            amount_apply = int(round(float(deduct)))
+            elig, block = _payout_withdraw_eligible(row)
+            if not elig:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"contact_id={it.contact_id} id_from={row.get('id_from')} "
+                        f"khong du dieu kien withdraw_requests: {block}"
+                    ),
+                )
+            bank_fields = _withdraw_bank_fields_from_contact(row)
+            assert bank_fields is not None
+            bank_type, stk, bank_name = bank_fields
+            id_from = str(row.get("id_from") or "").strip()
+            if not id_from:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"contact_id={it.contact_id} thieu id_from",
                 )
 
             new_avail = round(avail - float(deduct), 4)
@@ -1608,14 +1777,26 @@ def apply_zalo_payout_import(
                     status_code=409,
                     detail=f"Khong cap nhat duoc contact_id={it.contact_id} (so du da doi hoac bi khac xu ly)",
                 )
+            withdraw_id = _insert_withdraw_request_chua_bao_khach(
+                supabase,
+                id_from=id_from,
+                d_name=str(row.get("d_name") or "").strip() or None,
+                amount_vnd=amount_apply,
+                bank_type=bank_type,
+                stk=stk,
+                bank_name=bank_name,
+            )
             applied.append(
                 {
                     "contact_id": it.contact_id,
-                    "id_from": str(row.get("id_from") or "").strip(),
+                    "id_from": id_from,
                     "amount_vnd": amt,
+                    "is_admin": is_admin,
                     "deduct_applied": round(float(deduct), 4),
                     "available_after": new_avail,
                     "received_after": new_recv,
+                    "withdraw_request_id": withdraw_id,
+                    "withdraw_status": WITHDRAW_STATUS_CHUA_BAO_KHACH,
                 }
             )
             row["available_amount"] = new_avail
