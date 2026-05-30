@@ -45,7 +45,7 @@ def login(
     result = (
         get_supabase_client()
         .table("auth_users")
-        .select("id,username,password_hash,is_active")
+        .select("id,username,password_hash,is_active,id_globalzalo,id_zl")
         .eq("username", username)
         .limit(1)
         .execute()
@@ -57,7 +57,11 @@ def login(
         raise HTTPException(status_code=401, detail="Sai tai khoan hoac mat khau")
 
     user_id = str(user["id"])
-    access_token = create_access_token(user_id, settings)
+    access_token = create_access_token(
+        user_id,
+        settings,
+        id_globalzalo=str(user.get("id_globalzalo") or "").strip() or None,
+    )
     refresh_token = create_refresh_token()
     store_refresh_token(
         user_id=user_id,
@@ -84,7 +88,20 @@ def refresh(payload: RefreshPayload, settings: Settings = Depends(get_settings))
     revoke_refresh_token(payload.refresh_token)
     user_id = str(token_row["user_id"])
 
-    access_token = create_access_token(user_id, settings)
+    ures = (
+        get_supabase_client()
+        .table("auth_users")
+        .select("id_globalzalo,id_zl")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    urow = (ures.data or [None])[0] or {}
+    access_token = create_access_token(
+        user_id,
+        settings,
+        id_globalzalo=str(urow.get("id_globalzalo") or "").strip() or None,
+    )
     new_refresh_token = create_refresh_token()
     store_refresh_token(
         user_id=user_id,
@@ -114,6 +131,7 @@ def me(user: dict = Depends(get_current_user)):
             "id": user.get("id"),
             "username": user.get("username"),
             "id_zl": user.get("id_zl"),
+            "id_globalzalo": user.get("id_globalzalo"),
             "aff_id": user.get("aff_id"),
         }
     }
@@ -136,7 +154,7 @@ def update_me(payload: UpdateProfilePayload, user: dict = Depends(get_current_us
         supabase.table("auth_users").update(row).eq("id", user_id).execute()
         result = (
             supabase.table("auth_users")
-            .select("id,username,id_zl,aff_id")
+            .select("id,username,id_zl,id_globalzalo,aff_id")
             .eq("id", user_id)
             .limit(1)
             .execute()

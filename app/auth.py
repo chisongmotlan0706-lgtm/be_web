@@ -33,14 +33,30 @@ def verify_password(raw_password: str, password_hash: str) -> bool:
         return False
 
 
-def create_access_token(user_id: str, settings: Settings) -> str:
+def user_owner_global_zalo(user: dict) -> str:
+    """Uu tien auth_users.id_globalzalo, fallback id_zl (giai doan chuyen doi)."""
+    z = str(user.get("id_globalzalo") or "").strip()
+    if z:
+        return z
+    return str(user.get("id_zl") or "").strip()
+
+
+def create_access_token(
+    user_id: str,
+    settings: Settings,
+    *,
+    id_globalzalo: str | None = None,
+) -> str:
     now = _utc_now()
-    payload = {
+    payload: dict = {
         "sub": user_id,
         "type": "access",
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=settings.auth_access_token_minutes)).timestamp()),
     }
+    gz = str(id_globalzalo or "").strip()
+    if gz:
+        payload["id_globalzalo"] = gz
     return jwt.encode(payload, settings.auth_jwt_secret, algorithm="HS256")
 
 
@@ -116,7 +132,7 @@ def get_current_user(
     result = (
         get_supabase_client()
         .table("auth_users")
-        .select("id,username,is_active,id_zl,aff_id")
+        .select("id,username,is_active,id_zl,id_globalzalo,aff_id")
         .eq("id", user_id)
         .limit(1)
         .execute()

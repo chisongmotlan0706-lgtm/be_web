@@ -4,7 +4,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.auth import get_current_user
+from app.auth import get_current_user, user_owner_global_zalo
 from app.db import get_supabase_client
 
 router = APIRouter(prefix="/zalo-groups", tags=["zalo-groups"])
@@ -22,9 +22,9 @@ def list_zalo_groups(
     limit: int = Query(default=500, ge=1, le=2000),
     current_user: dict = Depends(get_current_user),
 ):
-    """Doc zalo_groups theo id_zl_main cua user dang nhap, moi cap nhat truoc."""
-    user_id_zl = str(current_user.get("id_zl") or "").strip()
-    if not user_id_zl:
+    """Doc zalo_groups theo id_global_main cua user dang nhap (id_globalzalo / fallback id_zl), moi cap nhat truoc."""
+    owner_global = user_owner_global_zalo(current_user)
+    if not owner_global:
         return {"count": 0, "items": []}
 
     try:
@@ -33,7 +33,7 @@ def list_zalo_groups(
             supabase.table("zalo_groups")
             .select("*")
             .is_("deleted_at", "null")
-            .eq("id_zl_main", user_id_zl)
+            .eq("id_global_main", owner_global)
             .order("updated_at", desc=True)
             .limit(limit)
             .execute()

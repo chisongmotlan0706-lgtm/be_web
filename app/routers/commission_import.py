@@ -13,7 +13,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from app.auth import get_current_user
+from app.auth import get_current_user, user_owner_global_zalo
 from app.commission_report import (
     parse_and_aggregate_report,
     parse_bill_conversion_completed_order_ids,
@@ -39,7 +39,7 @@ SPLIT_ROLE_AGENCY = "agency"
 SPLIT_ROLE_PLATFORM_OWNER = "platform_owner"
 CONFIG_KEY_CHUYEN_TIEN = "chuyen_tien"
 CONFIG_KEY_HOA_HONG = "hoa_hong"
-_DEFAULT_NOI_DUNG_TEMPLATE = "Ho tro hoa hong {id_from}"
+_DEFAULT_NOI_DUNG_TEMPLATE = "Ho tro hoa hong {id_global}"
 PAYOUT_STATUS_PAID = "Đã Trả Hoa Hồng"
 WITHDRAW_STATUS_CHUA_BAO_KHACH = "CHUA_BAO_KHACH"
 STATUS_BANK_LOI = "LOI_BANK"
@@ -104,48 +104,125 @@ def _apply_order_status_transition(rows: list[dict], existing_status: dict[str, 
 
 def _build_convert_info_map(supabase, sub_id_values: list[str]) -> dict[str, dict[str, str | None]]:
     """
-    Map sub_id1 -> convert_results info (zl, group).
-    Rule: id_zl in convert_results is unique.
+    Map sub_id1 (= convert_results.id_zl) -> {id_globalzalo, id_globalgroup}.
+    File Shopee sub_id1 trung id_zl; global lay tu cot da backfill tren convert_results.
     """
     mapping: dict[str, dict[str, str | None]] = {}
+
+    def _ingest_convert_rows(items: list[dict]) -> None:
+        for item in items or []:
+            id_zl = str(item.get("id_zl") or "").strip()
+            if not id_zl:
+                continue
+            id_gz = str(item.get("id_globalzalo") or "").strip() or None
+            id_ggrp = str(item.get("id_globalgroup") or "").strip() or None
+            mapping[id_zl] = {
+                "id_globalzalo": id_gz,
+                "id_globalgroup": id_ggrp,
+            }
+
     for chunk in _chunked(sub_id_values, LOOKUP_CHUNK):
         result = (
             supabase.table("convert_results")
-            .select("id_zl,zl,group")
+            .select("id_zl,id_globalzalo,id_globalgroup")
             .in_("id_zl", chunk)
             .execute()
         )
-        for item in result.data or []:
-            id_zl = str(item.get("id_zl") or "").strip()
-            zl = str(item.get("zl") or "").strip()
-            group_id = str(item.get("group") or "").strip() or None
-            if id_zl and zl:
-                mapping[id_zl] = {"zl": zl, "group_id": group_id}
+        _ingest_convert_rows(result.data or [])
     return mapping
 
 
-def _build_contact_map(supabase, id_from_values: list[str]) -> dict[str, dict[str, str | None]]:
-    """
-    Map zalo_contacts.id_from -> {id_from, name}
-    """
+def _build_contact_map_by_global(supabase, id_global_values: list[str]) -> dict[str, dict[str, str | None]]:
+    """Map zalo_contacts.id_global -> {id_global, name}."""
     mapping: dict[str, dict[str, str | None]] = {}
-    for chunk in _chunked(id_from_values, LOOKUP_CHUNK):
+    unique = sorted({str(x or "").strip() for x in id_global_values if str(x or "").strip()})
+    for chunk in _chunked(unique, LOOKUP_CHUNK):
         result = (
             supabase.table("zalo_contacts")
-            .select("id_from,d_name")
-            .in_("id_from", chunk)
+            .select("id_global,d_name")
+            .in_("id_global", chunk)
             .execute()
         )
         for item in result.data or []:
-            id_from = str(item.get("id_from") or "").strip()
-            if not id_from:
+            id_g = str(item.get("id_global") or "").strip()
+            if not id_g:
                 continue
             name_raw = item.get("d_name")
-            mapping[id_from] = {
-                "id_from": id_from,
+            mapping[id_g] = {
+                "id_global": id_g,
                 "name": str(name_raw).strip() if name_raw is not None else None,
             }
     return mapping
+
+
+def _resolve_contact_global(supabase, id_global_key: str | None) -> str | None:
+    """Xac nhan id_global ton tai trong zalo_contacts."""
+    k = str(id_global_key or "").strip()
+    if not k:
+        return None
+    try:
+        res = (
+            supabase.table("zalo_contacts")
+            .select("id_global")
+            .eq("id_global", k)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows:
+            v = str(rows[0].get("id_global") or "").strip()
+            return v or None
+    except Exception:
+        logger.exception("[commission-import] resolve contact id_global failed key=%s", k)
+    return None
+
+
+def _fetch_group_globals_for_import(
+    supabase, id_globalgroup: str
+) -> tuple[str | None, str | None, str | None]:
+    """
+    Tra zalo_groups theo id_global (= id_globalgroup tu convert_results).
+    Tra (group_id_global, agency_id_global, owner_id_global_main).
+
+    Dai ly (split agency id_global):
+      id_globalgroup -> zalo_groups.id_global -> zalo_groups.id_globalzalo.
+
+    Chu tool (split platform_owner id_global): zalo_groups.id_global_main.
+    """
+    gid = str(id_globalgroup or "").strip()
+    if not gid:
+        return None, None, None
+    res = (
+        supabase.table("zalo_groups")
+        .select("id_global,id_global_main,id_globalzalo")
+        .eq("id_global", gid)
+        .is_("deleted_at", "null")
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        return None, None, None
+    row = rows[0]
+    group_id_global = str(row.get("id_global") or "").strip() or None
+    owner_id_global_main = str(row.get("id_global_main") or "").strip() or None
+    agency_id_global = str(row.get("id_globalzalo") or "").strip() or None
+    return group_id_global, agency_id_global, owner_id_global_main
+
+
+def _strip_legacy_import_order_fields(row: dict) -> dict:
+    """Don import: chi id_global; xoa id_zl legacy tren ban ghi cu khi upsert."""
+    out = dict(row)
+    out.pop("id_zl", None)
+    out["id_zl"] = None
+    return out
+
+
+def _split_row_for_import_upsert(row: dict) -> dict:
+    """Split import: chi id_global; khong ghi id_zl (null de xoa legacy)."""
+    out = dict(row)
+    out["id_zl"] = None
+    return out
 
 
 def _clamp_pct_0_100(x: float) -> float:
@@ -221,26 +298,38 @@ def _is_order_status_cancelled(order_status: str | None) -> bool:
     return "hủy" in t or "huỷ" in t
 
 
-def _fetch_group_owner_and_agency_id_zl(
-    supabase, group_id: str
-) -> tuple[str | None, str | None]:
-    gid = str(group_id or "").strip()
+def _fetch_group_owner_and_agency_ids(
+    supabase, group_lookup_key: str
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """
+    Tra zalo_groups theo id_global (uu tien) roi group_id (local).
+    Tra (agency_id_zl, owner_id_zl_main, agency_id_global, owner_id_global_main).
+    """
+    gid = str(group_lookup_key or "").strip()
     if not gid:
-        return None, None
-    result = (
-        supabase.table("zalo_groups")
-        .select("id_zl,id_zl_main")
-        .eq("group_id", gid)
-        .is_("deleted_at", "null")
-        .limit(1)
-        .execute()
+        return None, None, None, None
+    row = None
+    for col in ("id_global", "group_id"):
+        res = (
+            supabase.table("zalo_groups")
+            .select("id_zl,id_zl_main,id_global,id_global_main")
+            .eq(col, gid)
+            .is_("deleted_at", "null")
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows:
+            row = rows[0]
+            break
+    if not row:
+        return None, None, None, None
+    return (
+        str(row.get("id_zl") or "").strip() or None,
+        str(row.get("id_zl_main") or "").strip() or None,
+        str(row.get("id_global") or "").strip() or None,
+        str(row.get("id_global_main") or "").strip() or None,
     )
-    rows = result.data or []
-    if not rows:
-        return None, None
-    agency_id_zl = str(rows[0].get("id_zl") or "").strip() or None
-    owner_id_zl_main = str(rows[0].get("id_zl_main") or "").strip() or None
-    return agency_id_zl, owner_id_zl_main
 
 
 def _fetch_commission_orders_rows_by_order_ids(
@@ -282,14 +371,14 @@ def _fetch_splits_detail_by_commission_order_ids(
     supabase, commission_ids: list[str]
 ) -> dict[str, dict[str, dict[str, str | float] | None]]:
     """
-    commission_order_id -> { agency: {id_zl, amount} | None, owner: {id_zl, amount} | None }
+    commission_order_id -> { agency: {id_global, amount} | None, owner: {id_global, amount} | None }
     """
     out: dict[str, dict[str, dict[str, str | float] | None]] = {}
     unique = sorted({str(x).strip() for x in commission_ids if str(x).strip()})
     for chunk in _chunked(unique, LOOKUP_CHUNK):
         result = (
             supabase.table(SPLIT_TABLE)
-            .select("commission_order_id,split_role,id_zl,amount")
+            .select("commission_order_id,split_role,id_global,amount")
             .in_("commission_order_id", chunk)
             .execute()
         )
@@ -301,7 +390,7 @@ def _fetch_splits_detail_by_commission_order_ids(
                 out[cid] = {"agency": None, "owner": None}
             role = str(item.get("split_role") or "").strip()
             entry: dict[str, str | float] = {
-                "id_zl": str(item.get("id_zl") or "").strip(),
+                "id_global": str(item.get("id_global") or "").strip(),
                 "amount": round(float(item.get("amount") or 0), 4),
             }
             if role == SPLIT_ROLE_AGENCY:
@@ -311,10 +400,10 @@ def _fetch_splits_detail_by_commission_order_ids(
     return out
 
 
-def _contact_display_name(contact_map: dict[str, dict], id_zl: str | None) -> str | None:
-    if not id_zl:
+def _contact_display_name(contact_map: dict[str, dict], id_key: str | None) -> str | None:
+    if not id_key:
         return None
-    info = contact_map.get(str(id_zl).strip())
+    info = contact_map.get(str(id_key).strip())
     if not info:
         return None
     name = info.get("name")
@@ -329,7 +418,7 @@ def _build_bill_sync_hh_preview(supabase, order_ids: list[str]) -> list[dict]:
         return []
     db_map = _fetch_orders_map_by_order_id(supabase, order_ids)
     commission_ids: list[str] = []
-    id_zls: list[str] = []
+    id_globals: list[str] = []
     for oid in order_ids:
         row = db_map.get(oid)
         if not row:
@@ -337,16 +426,16 @@ def _build_bill_sync_hh_preview(supabase, order_ids: list[str]) -> list[dict]:
         raw_id = row.get("id")
         if raw_id is not None:
             commission_ids.append(str(raw_id))
-        zl = str(row.get("id_zl") or "").strip()
-        if zl:
-            id_zls.append(zl)
+        id_global = str(row.get("id_global") or "").strip()
+        if id_global:
+            id_globals.append(id_global)
     split_detail = _fetch_splits_detail_by_commission_order_ids(supabase, commission_ids)
     for detail in split_detail.values():
         for role_key in ("agency", "owner"):
             part = detail.get(role_key)
-            if part and part.get("id_zl"):
-                id_zls.append(str(part["id_zl"]).strip())
-    contact_map = _build_contact_map(supabase, sorted(set(id_zls)))
+            if part and part.get("id_global"):
+                id_globals.append(str(part["id_global"]).strip())
+    contact_map = _build_contact_map_by_global(supabase, sorted(set(id_globals)))
 
     empty_payout = {
         "user_name": None,
@@ -366,7 +455,7 @@ def _build_bill_sync_hh_preview(supabase, order_ids: list[str]) -> list[dict]:
                     "order_id": oid,
                     "db_found": False,
                     "db_order_status": None,
-                    "id_zl": None,
+                    "id_global": None,
                     "has_zalo_contact": False,
                     "eligible": False,
                     "skip_reason": "Khong co trong DB (chua import)",
@@ -376,8 +465,8 @@ def _build_bill_sync_hh_preview(supabase, order_ids: list[str]) -> list[dict]:
             continue
 
         db_st = str(row.get("order_status") or "").strip()
-        id_zl = str(row.get("id_zl") or "").strip() or None
-        has_contact = bool(id_zl and id_zl in contact_map)
+        id_global = str(row.get("id_global") or "").strip() or None
+        has_contact = bool(id_global and id_global in contact_map)
         cid = str(row.get("id") or "").strip()
         hh_user = round(float(row.get("hh_user") or 0), 4)
 
@@ -387,14 +476,14 @@ def _build_bill_sync_hh_preview(supabase, order_ids: list[str]) -> list[dict]:
             skip_reason = "Da cong tien trong DB"
         elif db_st != ORDER_STATUS_COMPLETED_SYNC:
             skip_reason = f"Trang thai DB khac Hoan thanh ({db_st or 'rong'})"
-        elif not id_zl:
-            skip_reason = "Thieu id_zl (affiliate)"
+        elif not id_global:
+            skip_reason = "Thieu id_global (affiliate)"
         elif not has_contact:
-            skip_reason = "Khong co zalo_contacts theo id_zl"
+            skip_reason = "Khong co zalo_contacts theo id_global"
         else:
             eligible = True
 
-        user_name = _contact_display_name(contact_map, id_zl)
+        user_name = _contact_display_name(contact_map, id_global)
         if not user_name and row.get("name"):
             user_name = str(row.get("name") or "").strip() or None
         user_amount = hh_user if eligible else 0.0
@@ -407,15 +496,15 @@ def _build_bill_sync_hh_preview(supabase, order_ids: list[str]) -> list[dict]:
             parts = split_detail.get(cid) or {}
             agency_part = parts.get("agency")
             if agency_part:
-                agency_zl = str(agency_part.get("id_zl") or "").strip()
-                agency_name = _contact_display_name(contact_map, agency_zl)
-                if agency_zl and agency_zl in contact_map and eligible:
+                agency_global = str(agency_part.get("id_global") or "").strip()
+                agency_name = _contact_display_name(contact_map, agency_global)
+                if agency_global and agency_global in contact_map and eligible:
                     agency_amount = float(agency_part.get("amount") or 0)
             owner_part = parts.get("owner")
             if owner_part:
-                owner_zl = str(owner_part.get("id_zl") or "").strip()
-                owner_name = _contact_display_name(contact_map, owner_zl)
-                if owner_zl and owner_zl in contact_map and eligible:
+                owner_global = str(owner_part.get("id_global") or "").strip()
+                owner_name = _contact_display_name(contact_map, owner_global)
+                if owner_global and owner_global in contact_map and eligible:
                     owner_amount = float(owner_part.get("amount") or 0)
 
         out.append(
@@ -423,7 +512,7 @@ def _build_bill_sync_hh_preview(supabase, order_ids: list[str]) -> list[dict]:
                 "order_id": oid,
                 "db_found": True,
                 "db_order_status": db_st,
-                "id_zl": id_zl,
+                "id_global": id_global,
                 "has_zalo_contact": has_contact,
                 "eligible": eligible,
                 "skip_reason": skip_reason,
@@ -514,7 +603,7 @@ def _fetch_zalo_contacts_available_total(supabase) -> float:
         result = (
             supabase.table("zalo_contacts")
             .select("available_amount")
-            .order("id_from")
+            .order("id_global")
             .range(offset, offset + page_size - 1)
             .execute()
         )
@@ -538,7 +627,7 @@ def _fetch_chuyen_tien_settings(supabase) -> tuple[float, str]:
     """
     app_config_kv.config_key = chuyen_tien:
     - value_1: nguong VND toi thieu (available_amount) de hien thi / export.
-    - value_2: tuy chon — mau noi dung CK; ho tro {id_from}, {d_name}. Neu trong -> mac dinh.
+    - value_2: tuy chon — mau noi dung CK; ho tro {id_global}, {d_name}. Neu trong -> mac dinh.
     Chi ap nguong khi dong ton tai, is_active, value_1 parse duoc > 0.
     """
     try:
@@ -564,25 +653,25 @@ def _fetch_chuyen_tien_settings(supabase) -> tuple[float, str]:
         return (0.0, _DEFAULT_NOI_DUNG_TEMPLATE)
 
 
-def _format_noi_dung_ck(template: str, *, id_from: str, d_name: str) -> str:
-    safe_name = (d_name or "").strip() or id_from
+def _format_noi_dung_ck(template: str, *, id_global: str, d_name: str) -> str:
+    safe_name = (d_name or "").strip() or id_global
     try:
-        return str(template).format(id_from=id_from, d_name=safe_name)
+        return str(template).format(id_global=id_global, d_name=safe_name)
     except (KeyError, ValueError, IndexError):
         return (
             str(template)
-            .replace("{id_from}", id_from)
+            .replace("{id_global}", id_global)
             .replace("{d_name}", safe_name)
         )
 
 
 def _fetch_group_ids_by_owner(
-    supabase, *, owner_id_zl_main: str, active_only: bool
+    supabase, *, owner_id_global_main: str, active_only: bool
 ) -> list[str]:
-    """group_id tu zalo_groups: id_zl_main = owner, chua xoa mem."""
+    """id_global tu zalo_groups: id_global_main = owner (auth id_globalzalo), chua xoa mem."""
     out: list[str] = []
     seen: set[str] = set()
-    owner = str(owner_id_zl_main or "").strip()
+    owner = str(owner_id_global_main or "").strip()
     if not owner:
         return out
     offset = 0
@@ -590,8 +679,8 @@ def _fetch_group_ids_by_owner(
     while True:
         query = (
             supabase.table("zalo_groups")
-            .select("group_id")
-            .eq("id_zl_main", owner)
+            .select("id_global")
+            .eq("id_global_main", owner)
             .is_("deleted_at", "null")
             .order("id")
             .range(offset, offset + page_size - 1)
@@ -603,7 +692,7 @@ def _fetch_group_ids_by_owner(
         if not rows:
             break
         for row in rows:
-            gid = str(row.get("group_id") or "").strip()
+            gid = str(row.get("id_global") or "").strip()
             if gid and gid not in seen:
                 seen.add(gid)
                 out.append(gid)
@@ -613,10 +702,12 @@ def _fetch_group_ids_by_owner(
     return out
 
 
-def _fetch_id_from_set_for_group_ids(supabase, group_ids: list[str]) -> set[str]:
-    """Tat ca id_from cua zalo_contacts co id_group thuoc danh sach group_id."""
+def _fetch_contact_globals_for_group_ids(supabase, group_global_ids: list[str]) -> set[str]:
+    """id_global cua zalo_contacts co id_global_gr thuoc danh sach id_global nhom."""
     out: set[str] = set()
-    unique_groups = sorted({str(g or "").strip() for g in group_ids if str(g or "").strip()})
+    unique_groups = sorted(
+        {str(g or "").strip() for g in group_global_ids if str(g or "").strip()}
+    )
     if not unique_groups:
         return out
     page_size = 1000
@@ -625,8 +716,8 @@ def _fetch_id_from_set_for_group_ids(supabase, group_ids: list[str]) -> set[str]
         while True:
             result = (
                 supabase.table("zalo_contacts")
-                .select("id_from")
-                .in_("id_group", chunk)
+                .select("id_global")
+                .in_("id_global_gr", chunk)
                 .order("id")
                 .range(offset, offset + page_size - 1)
                 .execute()
@@ -635,7 +726,7 @@ def _fetch_id_from_set_for_group_ids(supabase, group_ids: list[str]) -> set[str]
             if not rows:
                 break
             for row in rows:
-                zid = str(row.get("id_from") or "").strip()
+                zid = str(row.get("id_global") or "").strip()
                 if zid:
                     out.add(zid)
             if len(rows) < page_size:
@@ -647,14 +738,16 @@ def _fetch_id_from_set_for_group_ids(supabase, group_ids: list[str]) -> set[str]
 def _fetch_zalo_contacts_by_id_groups(
     supabase,
     *,
-    group_ids: list[str],
+    group_global_ids: list[str],
     limit: int,
     min_available_amount: float | None = None,
 ) -> list[dict]:
     """limit > 0: cat sau sort updated_at. limit = 0: lay het (de sort khac o buoc enrich)."""
     if limit < 0:
         return []
-    unique_groups = sorted({str(g or "").strip() for g in group_ids if str(g or "").strip()})
+    unique_groups = sorted(
+        {str(g or "").strip() for g in group_global_ids if str(g or "").strip()}
+    )
     if not unique_groups:
         return []
     allowed = set(unique_groups)
@@ -663,16 +756,16 @@ def _fetch_zalo_contacts_by_id_groups(
         query = (
             supabase.table("zalo_contacts")
             .select(
-                "id,id_from,d_name,id_group,available_amount,actual_amount,estimated_amount,"
+                "id,id_global,d_name,id_global_gr,available_amount,actual_amount,estimated_amount,"
                 "role,bank_name,bank_type,stk,status_bank,updated_at,received"
             )
-            .in_("id_group", chunk)
+            .in_("id_global_gr", chunk)
         )
         if min_available_amount is not None and min_available_amount > 0:
             query = query.gte("available_amount", min_available_amount)
         result = query.execute()
         for item in result.data or []:
-            gid = str(item.get("id_group") or "").strip()
+            gid = str(item.get("id_global_gr") or "").strip()
             if gid in allowed:
                 out.append(item)
     out.sort(
@@ -685,17 +778,17 @@ def _fetch_zalo_contacts_by_id_groups(
 
 
 def _fetch_order_balance_maps_by_id_zl(
-    supabase, *, allowed_id_zl: set[str] | None = None
+    supabase, *, allowed_contact_global_ids: set[str] | None = None
 ) -> tuple[dict[str, float], dict[str, float]]:
     pending_map: dict[str, float] = {}
     completed_map: dict[str, float] = {}
-    allowed = allowed_id_zl or set()
+    allowed = allowed_contact_global_ids or set()
     offset = 0
     page_size = 1000
     while True:
         result = (
             supabase.table("affiliate_commission_orders")
-            .select("id_zl,hh_user,order_status")
+            .select("id_global,hh_user,order_status")
             .order("id")
             .range(offset, offset + page_size - 1)
             .execute()
@@ -704,19 +797,19 @@ def _fetch_order_balance_maps_by_id_zl(
         if not rows:
             break
         for row in rows:
-            id_zl = str(row.get("id_zl") or "").strip()
-            if not id_zl:
+            id_g = str(row.get("id_global") or "").strip()
+            if not id_g:
                 continue
-            if allowed and id_zl not in allowed:
+            if allowed and id_g not in allowed:
                 continue
             status = str(row.get("order_status") or "").strip()
             if _is_order_status_cancelled(status):
                 continue
             amount = float(row.get("hh_user") or 0)
             if status == "Đang chờ xử lý":
-                pending_map[id_zl] = pending_map.get(id_zl, 0.0) + amount
+                pending_map[id_g] = pending_map.get(id_g, 0.0) + amount
             elif status == "Hoàn thành":
-                completed_map[id_zl] = completed_map.get(id_zl, 0.0) + amount
+                completed_map[id_g] = completed_map.get(id_g, 0.0) + amount
         if len(rows) < page_size:
             break
         offset += page_size
@@ -724,7 +817,7 @@ def _fetch_order_balance_maps_by_id_zl(
 
 
 def _fetch_split_balance_maps_by_id_zl(
-    supabase, active_group_id_zl: set[str]
+    supabase, active_member_global_ids: set[str]
 ) -> tuple[dict[str, float], dict[str, float]]:
     pending_map: dict[str, float] = {}
     completed_map: dict[str, float] = {}
@@ -733,7 +826,7 @@ def _fetch_split_balance_maps_by_id_zl(
     while True:
         result = (
             supabase.table(SPLIT_TABLE)
-            .select("id_zl,amount,order_status")
+            .select("id_global,amount,order_status")
             .order("id")
             .range(offset, offset + page_size - 1)
             .execute()
@@ -742,17 +835,17 @@ def _fetch_split_balance_maps_by_id_zl(
         if not rows:
             break
         for row in rows:
-            id_zl = str(row.get("id_zl") or "").strip()
-            if not id_zl or id_zl not in active_group_id_zl:
+            id_g = str(row.get("id_global") or "").strip()
+            if not id_g or id_g not in active_member_global_ids:
                 continue
             status = str(row.get("order_status") or "").strip()
             if _is_order_status_cancelled(status):
                 continue
             amount = float(row.get("amount") or 0)
             if status == "Đang chờ xử lý":
-                pending_map[id_zl] = pending_map.get(id_zl, 0.0) + amount
+                pending_map[id_g] = pending_map.get(id_g, 0.0) + amount
             elif status == "Hoàn thành":
-                completed_map[id_zl] = completed_map.get(id_zl, 0.0) + amount
+                completed_map[id_g] = completed_map.get(id_g, 0.0) + amount
         if len(rows) < page_size:
             break
         offset += page_size
@@ -863,28 +956,32 @@ def _sync_commission_order_splits_for_import(
             continue
 
         convert_info = convert_info_map.get(sub_id1)
-        group_id_res: str | None = None
-        agency_id_zl: str | None = None
-        owner_id_zl_main: str | None = None
-        if convert_info:
-            group_id_res = convert_info.get("group_id")
-            if group_id_res:
-                gid = str(group_id_res).strip() or None
-                group_id_res = gid
-                if gid:
-                    agency_id_zl, owner_id_zl_main = _fetch_group_owner_and_agency_id_zl(
-                        supabase, gid
-                    )
-
-        if not group_id_res:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Khong tim thay group_id cho order_id={oid} (sub_id1={sub_id1})",
+        id_globalgroup = (
+            str(convert_info.get("id_globalgroup") or "").strip() or None if convert_info else None
+        )
+        group_id_global: str | None = None
+        agency_id_global: str | None = None
+        owner_id_global_main: str | None = None
+        if id_globalgroup:
+            group_id_global, agency_id_global, owner_id_global_main = _fetch_group_globals_for_import(
+                supabase, id_globalgroup
             )
-        if not owner_id_zl_main:
+
+        if not id_globalgroup:
             raise HTTPException(
                 status_code=500,
-                detail=f"Khong tim thay id_zl_main trong zalo_groups cho group_id={group_id_res} (order_id={oid})",
+                detail=(
+                    f"Khong tim thay id_globalgroup (convert_results) cho order_id={oid} "
+                    f"(sub_id1={sub_id1})"
+                ),
+            )
+        if not owner_id_global_main:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Khong tim thay id_global_main trong zalo_groups cho id_globalgroup="
+                    f"{id_globalgroup} (order_id={oid})"
+                ),
             )
 
         agency_amount, owner_amount, _ = _amounts_from_hoa_hong_net(
@@ -893,15 +990,17 @@ def _sync_commission_order_splits_for_import(
         agency_pct_stored = _effective_split_payout_pct_on_net(hoa_v1, hoa_v4)
         owner_pct_stored = _effective_split_payout_pct_on_net(hoa_v2, hoa_v4)
 
+        split_group_id = group_id_global or id_globalgroup
+
         split_rows: list[dict] = []
-        if agency_id_zl:
+        if agency_id_global:
             split_rows.append(
                 {
                     "commission_order_id": cid,
                     "order_id": oid,
                     "split_role": SPLIT_ROLE_AGENCY,
-                    "id_zl": agency_id_zl,
-                    "group_id": group_id_res,
+                    "id_global": agency_id_global,
+                    "group_id": split_group_id,
                     "payout_pct": agency_pct_stored,
                     "amount": agency_amount,
                     "net_affiliate_commission_at_split": net,
@@ -915,8 +1014,8 @@ def _sync_commission_order_splits_for_import(
                 "commission_order_id": cid,
                 "order_id": oid,
                 "split_role": SPLIT_ROLE_PLATFORM_OWNER,
-                "id_zl": owner_id_zl_main,
-                "group_id": group_id_res,
+                "id_global": owner_id_global_main,
+                "group_id": split_group_id,
                 "payout_pct": owner_pct_stored,
                 "amount": owner_amount,
                 "net_affiliate_commission_at_split": net,
@@ -928,7 +1027,7 @@ def _sync_commission_order_splits_for_import(
 
         try:
             supabase.table(SPLIT_TABLE).upsert(
-                split_rows,
+                [_split_row_for_import_upsert(r) for r in split_rows],
                 on_conflict="commission_order_id,split_role",
             ).execute()
             stats["splits_rows_upserted"] += len(split_rows)
@@ -939,7 +1038,10 @@ def _sync_commission_order_splits_for_import(
                 detail=f"Luu splits loi: {exc}",
             ) from exc
 
-        if not agency_id_zl:
+        agency_row_present = any(
+            r.get("split_role") == SPLIT_ROLE_AGENCY for r in split_rows
+        )
+        if not agency_row_present:
             try:
                 del_res = (
                     supabase.table(SPLIT_TABLE)
@@ -1030,56 +1132,56 @@ def get_commission_summary(
 def _enriched_zalo_contacts_for_owner(
     supabase,
     *,
-    user_id_zl_main: str,
+    user_owner_global: str,
     limit: int,
     min_available_amount: float | None,
     sort_by: str = "updated_at",
     include_admin: bool = False,
 ) -> list[dict]:
-    owner = str(user_id_zl_main or "").strip()
+    owner = str(user_owner_global or "").strip()
     if not owner:
         return []
 
-    all_group_ids = _fetch_group_ids_by_owner(
-        supabase, owner_id_zl_main=owner, active_only=False
+    all_group_globals = _fetch_group_ids_by_owner(
+        supabase, owner_id_global_main=owner, active_only=False
     )
-    if not all_group_ids:
+    if not all_group_globals:
         return []
 
-    allowed_contact_id_zl = _fetch_id_from_set_for_group_ids(supabase, all_group_ids)
-    if not allowed_contact_id_zl:
+    allowed_contact_global = _fetch_contact_globals_for_group_ids(supabase, all_group_globals)
+    if not allowed_contact_global:
         return []
 
     order_pending_map, order_completed_map = _fetch_order_balance_maps_by_id_zl(
-        supabase, allowed_id_zl=allowed_contact_id_zl
+        supabase, allowed_contact_global_ids=allowed_contact_global
     )
-    active_group_ids = _fetch_group_ids_by_owner(
-        supabase, owner_id_zl_main=owner, active_only=True
+    active_group_globals = _fetch_group_ids_by_owner(
+        supabase, owner_id_global_main=owner, active_only=True
     )
-    active_member_id_zl = (
-        _fetch_id_from_set_for_group_ids(supabase, active_group_ids)
-        if active_group_ids
+    active_member_global = (
+        _fetch_contact_globals_for_group_ids(supabase, active_group_globals)
+        if active_group_globals
         else set()
     )
     split_pending_map, split_completed_map = _fetch_split_balance_maps_by_id_zl(
-        supabase, active_member_id_zl
+        supabase, active_member_global
     )
     sort_key = str(sort_by or "updated_at").strip().lower()
     fetch_cap = 0 if sort_key == "tien_co_the_rut" else limit
     items = _fetch_zalo_contacts_by_id_groups(
         supabase,
-        group_ids=all_group_ids,
+        group_global_ids=all_group_globals,
         limit=fetch_cap,
         min_available_amount=min_available_amount,
     )
     if not include_admin:
         items = [it for it in items if not _is_admin_zalo_contact_role(it.get("role"))]
     for item in items:
-        id_from = str(item.get("id_from") or "").strip()
-        order_pending = order_pending_map.get(id_from, 0.0)
-        order_completed = order_completed_map.get(id_from, 0.0)
-        split_pending = split_pending_map.get(id_from, 0.0)
-        split_completed = split_completed_map.get(id_from, 0.0)
+        id_c = str(item.get("id_global") or "").strip()
+        order_pending = order_pending_map.get(id_c, 0.0)
+        order_completed = order_completed_map.get(id_c, 0.0)
+        split_pending = split_pending_map.get(id_c, 0.0)
+        split_completed = split_completed_map.get(id_c, 0.0)
         item["dang_giao_hang"] = round(order_pending + split_pending, 4)
         item["cho_duyet"] = round(order_completed + split_completed, 4)
         item["tien_co_the_rut"] = float(_floor_vnd_to_thousand(float(item.get("available_amount") or 0)))
@@ -1099,8 +1201,8 @@ def _zalo_contacts_transfer_workbook(items: list[dict], *, noi_dung_template: st
 
     headers = [
         "STT",
-        "id_from",
-        "id_group",
+        "id_global",
+        "id_global_gr",
         "Số tiền chuyển",
         "TK hưởng",
         "Tên người hưởng",
@@ -1116,23 +1218,24 @@ def _zalo_contacts_transfer_workbook(items: list[dict], *, noi_dung_template: st
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     for idx, item in enumerate(items, start=1):
-        id_from = str(item.get("id_from") or "").strip()
-        id_group = str(item.get("id_group") or "").strip()
+        id_g = str(item.get("id_global") or "").strip()
+        id_gr = str(item.get("id_global_gr") or "").strip()
         d_name = str(item.get("d_name") or "").strip()
         bank = str(item.get("bank_type") or "").strip()
         stk_raw = str(item.get("stk") or "").strip()
         amt = _floor_vnd_to_thousand(float(item.get("available_amount") or 0))
-        noi = _format_noi_dung_ck(noi_dung_template, id_from=id_from, d_name=d_name)
+        # Noi dung chuyen khoan yeu cau co dinh, khong dau: "Hoan tien hoa hong <so_tien>".
+        noi = f"Hoan tien hoa hong {amt}"
         row_num = ws.max_row + 1
         ws.cell(row=row_num, column=1, value=idx)
-        c_id = ws.cell(row=row_num, column=2, value=id_from if id_from else "")
+        c_id = ws.cell(row=row_num, column=2, value=id_g if id_g else "")
         c_id.number_format = "@"
-        c_gid = ws.cell(row=row_num, column=3, value=id_group if id_group else "")
+        c_gid = ws.cell(row=row_num, column=3, value=id_gr if id_gr else "")
         c_gid.number_format = "@"
         ws.cell(row=row_num, column=4, value=amt)
         c_stk = ws.cell(row=row_num, column=5, value=stk_raw if stk_raw else "")
         c_stk.number_format = "@"
-        ws.cell(row=row_num, column=6, value=d_name if d_name else id_from)
+        ws.cell(row=row_num, column=6, value=d_name if d_name else id_g)
         ws.cell(row=row_num, column=7, value=bank)
         ws.cell(row=row_num, column=8, value=noi)
         ws.cell(row=row_num, column=9, value="")
@@ -1172,14 +1275,14 @@ def list_zalo_contacts(
         )
     try:
         supabase = get_supabase_client()
-        user_id_zl_main = str(current_user.get("id_zl") or "").strip()
+        user_owner = user_owner_global_zalo(current_user)
         min_vnd, _tpl = _fetch_chuyen_tien_settings(supabase)
         min_arg = None
         if apply_min_filter and min_vnd > 0:
             min_arg = min_vnd
         items = _enriched_zalo_contacts_for_owner(
             supabase,
-            user_id_zl_main=user_id_zl_main,
+            user_owner_global=user_owner,
             limit=limit,
             min_available_amount=min_arg,
             sort_by=sort_norm,
@@ -1206,12 +1309,15 @@ def _contact_row_owned_by_user(
     supabase,
     *,
     contact_id: int,
-    user_id_zl_main: str,
+    user_owner_global: str,
 ) -> dict:
-    owner = str(user_id_zl_main or "").strip()
+    owner = str(user_owner_global or "").strip()
     if not owner:
-        raise HTTPException(status_code=400, detail="Tai khoan khong co id_zl")
-    contacts = _all_zalo_contact_rows_for_owner(supabase, user_id_zl_main=owner)
+        raise HTTPException(
+            status_code=400,
+            detail="Tai khoan khong co id_globalzalo (va khong co id_zl fallback)",
+        )
+    contacts = _all_zalo_contact_rows_for_owner(supabase, user_owner_global=owner)
     _, by_id = _contact_maps_for_payout(contacts)
     row = by_id.get(contact_id)
     if not row:
@@ -1230,9 +1336,9 @@ def mark_zalo_contact_loi_bank(
     """Danh dau contact LOI_BANK (status_bank = LOI_BANK), chi contact thuoc nhom cua user."""
     try:
         supabase = get_supabase_client()
-        user_id_zl_main = str(current_user.get("id_zl") or "").strip()
+        user_owner = user_owner_global_zalo(current_user)
         _contact_row_owned_by_user(
-            supabase, contact_id=contact_id, user_id_zl_main=user_id_zl_main
+            supabase, contact_id=contact_id, user_owner_global=user_owner
         )
         res = (
             supabase.table("zalo_contacts")
@@ -1249,7 +1355,7 @@ def mark_zalo_contact_loi_bank(
         row = updated[0]
         return {
             "contact_id": contact_id,
-            "id_from": str(row.get("id_from") or "").strip(),
+            "id_global": str(row.get("id_global") or "").strip() or None,
             "status_bank": str(row.get("status_bank") or STATUS_BANK_LOI),
         }
     except HTTPException:
@@ -1272,12 +1378,12 @@ def export_zalo_contacts_xlsx(
 ):
     try:
         supabase = get_supabase_client()
-        user_id_zl_main = str(current_user.get("id_zl") or "").strip()
+        user_owner = user_owner_global_zalo(current_user)
         min_vnd, noi_tpl = _fetch_chuyen_tien_settings(supabase)
         min_arg = min_vnd if min_vnd > 0 else None
         items = _enriched_zalo_contacts_for_owner(
             supabase,
-            user_id_zl_main=user_id_zl_main,
+            user_owner_global=user_owner,
             limit=limit,
             min_available_amount=min_arg,
             include_admin=include_admin,
@@ -1304,10 +1410,10 @@ def _fold_col_name(s: str) -> str:
     return "".join(c for c in t if unicodedata.category(c) != "Mn").replace(" ", "")
 
 
-def _pick_id_from_column(columns: list[str]) -> str | None:
+def _pick_id_global_column(columns: list[str]) -> str | None:
     for c in columns:
         f = _fold_col_name(c)
-        if f in ("idfrom", "id_from") or "mazalo" in f or f.endswith("idfrom"):
+        if "id_global" in f or f == "idglobal":
             return c
     return None
 
@@ -1338,19 +1444,19 @@ def _is_payout_paid_cell(v: object) -> bool:
 
 
 def _all_zalo_contact_rows_for_owner(
-    supabase, *, user_id_zl_main: str, max_rows: int = 20000
+    supabase, *, user_owner_global: str, max_rows: int = 20000
 ) -> list[dict]:
-    owner = str(user_id_zl_main or "").strip()
+    owner = str(user_owner_global or "").strip()
     if not owner:
         return []
-    all_group_ids = _fetch_group_ids_by_owner(
-        supabase, owner_id_zl_main=owner, active_only=False
+    all_group_globals = _fetch_group_ids_by_owner(
+        supabase, owner_id_global_main=owner, active_only=False
     )
-    if not all_group_ids:
+    if not all_group_globals:
         return []
     return _fetch_zalo_contacts_by_id_groups(
         supabase,
-        group_ids=all_group_ids,
+        group_global_ids=all_group_globals,
         limit=max_rows,
         min_available_amount=None,
     )
@@ -1379,7 +1485,7 @@ def _withdraw_bank_fields_from_contact(row: dict) -> tuple[str, str, str] | None
 def _insert_withdraw_request_chua_bao_khach(
     supabase,
     *,
-    id_from: str,
+    id_global: str,
     d_name: str | None,
     amount_vnd: int,
     bank_type: str,
@@ -1389,7 +1495,7 @@ def _insert_withdraw_request_chua_bao_khach(
     if amount_vnd <= 0:
         raise HTTPException(status_code=400, detail="amount withdraw_requests phai > 0")
     payload = {
-        "id_from": id_from,
+        "id_global": id_global,
         "d_name": d_name,
         "amount": amount_vnd,
         "bank_type": bank_type,
@@ -1407,7 +1513,8 @@ def _insert_withdraw_request_chua_bao_khach(
 
 
 def _contact_maps_for_payout(rows: list[dict]) -> tuple[dict[str, list[dict]], dict[int, dict]]:
-    by_id_from: dict[str, list[dict]] = {}
+    """Key theo id_global (global-only)."""
+    by_contact_key: dict[str, list[dict]] = {}
     by_id: dict[int, dict] = {}
     for row in rows:
         cid = row.get("id")
@@ -1417,12 +1524,12 @@ def _contact_maps_for_payout(rows: list[dict]) -> tuple[dict[str, list[dict]], d
             cid_int = int(cid)
         except (TypeError, ValueError):
             continue
-        zid = str(row.get("id_from") or "").strip()
-        if not zid:
+        id_g = str(row.get("id_global") or "").strip()
+        if not id_g:
             continue
         by_id[cid_int] = row
-        by_id_from.setdefault(zid, []).append(row)
-    return by_id_from, by_id
+        by_contact_key.setdefault(id_g, []).append(row)
+    return by_contact_key, by_id
 
 
 def _parse_amount_cell(v: object) -> float | None:
@@ -1439,7 +1546,7 @@ def _parse_amount_cell(v: object) -> float | None:
         return None
 
 
-def _excel_cell_to_id_from(v: object) -> str:
+def _excel_cell_to_id_global(v: object) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
     if isinstance(v, float) and v.is_integer():
@@ -1471,21 +1578,21 @@ def _floor_vnd_to_thousand(v: float) -> int:
 def _payout_preview_from_dataframe(
     df: pd.DataFrame,
     *,
-    by_id_from: dict[str, list[dict]],
+    by_id_global: dict[str, list[dict]],
 ) -> tuple[list[dict], dict[str, int]]:
     columns = [str(c).strip() for c in df.columns]
-    col_id = _pick_id_from_column(columns)
+    col_id = _pick_id_global_column(columns)
     col_amt = _pick_amount_column(columns)
     col_st = _pick_status_column(columns)
     if not col_id and not col_amt:
         raise HTTPException(
             status_code=400,
-            detail="File thieu cot id_from (hoac Ma Zalo) va cot So tien chuyen",
+            detail="File thieu cot id_global va cot So tien chuyen",
         )
     if not col_id:
         raise HTTPException(
             status_code=400,
-            detail="File thieu cot id_from (hoac Ma Zalo)",
+            detail="File thieu cot id_global",
         )
     if not col_amt:
         raise HTTPException(
@@ -1511,13 +1618,13 @@ def _payout_preview_from_dataframe(
 
     for i, row in df.iterrows():
         sheet_row = int(i) + 2
-        id_from = _excel_cell_to_id_from(row.get(col_id))
+        id_global = _excel_cell_to_id_global(row.get(col_id))
         amt = _parse_amount_cell(row.get(col_amt))
         st_cell = row.get(col_st)
 
         base: dict = {
             "sheet_row": sheet_row,
-            "id_from": id_from or None,
+            "id_global": id_global or None,
             "amount_file": None,
             "status_raw": None if st_cell is None or (isinstance(st_cell, float) and pd.isna(st_cell)) else str(st_cell),
             "result": "",
@@ -1532,11 +1639,11 @@ def _payout_preview_from_dataframe(
             "is_admin": False,
         }
 
-        if not id_from:
+        if not id_global:
             if amt is None and (st_cell is None or (isinstance(st_cell, float) and pd.isna(st_cell))):
                 continue
             base["result"] = "bad_row"
-            base["message"] = "Thieu id_from"
+            base["message"] = "Thieu id_global"
             summary["bad_row"] += 1
             out_rows.append(base)
             continue
@@ -1548,16 +1655,16 @@ def _payout_preview_from_dataframe(
             out_rows.append(base)
             continue
 
-        matches = by_id_from.get(id_from, [])
+        matches = by_id_global.get(id_global, [])
         if not matches:
             base["result"] = "not_found"
-            base["message"] = "id_from khong thuoc danh sach cua ban"
+            base["message"] = "Ma khong thuoc danh sach cua ban (id_global)"
             summary["not_found"] += 1
             out_rows.append(base)
             continue
         if len(matches) > 1:
             base["result"] = "ambiguous"
-            base["message"] = "Trung id_from tren nhieu ban ghi — can xu ly thu cong"
+            base["message"] = "Trung ma tren nhieu ban ghi — can xu ly thu cong"
             summary["ambiguous"] += 1
             out_rows.append(base)
             continue
@@ -1633,7 +1740,7 @@ async def preview_zalo_payout_import(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
 ):
-    """Doc Excel (dong dau = header): id_from, So tien chuyen, Hoan Tien chua = Da Tra Hoa Hong."""
+    """Doc Excel (dong dau = header): id_global, So tien chuyen, Hoan Tien chua = Da Tra Hoa Hong."""
     try:
         raw = await file.read()
         if len(raw) > PAYOUT_IMPORT_MAX_BYTES:
@@ -1642,18 +1749,21 @@ async def preview_zalo_payout_import(
             raise HTTPException(status_code=400, detail="File rong")
 
         supabase = get_supabase_client()
-        user_id_zl_main = str(current_user.get("id_zl") or "").strip()
-        if not user_id_zl_main:
-            raise HTTPException(status_code=400, detail="Tai khoan khong co id_zl")
+        user_owner = user_owner_global_zalo(current_user)
+        if not user_owner:
+            raise HTTPException(
+                status_code=400,
+                detail="Tai khoan khong co id_globalzalo (va khong co id_zl fallback)",
+            )
 
         try:
             df = pd.read_excel(BytesIO(raw), header=0, engine="openpyxl")
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Khong doc duoc Excel: {exc}") from exc
 
-        contacts = _all_zalo_contact_rows_for_owner(supabase, user_id_zl_main=user_id_zl_main)
-        by_id_from, _by_id = _contact_maps_for_payout(contacts)
-        rows, summary = _payout_preview_from_dataframe(df, by_id_from=by_id_from)
+        contacts = _all_zalo_contact_rows_for_owner(supabase, user_owner_global=user_owner)
+        by_id_global, _by_id = _contact_maps_for_payout(contacts)
+        rows, summary = _payout_preview_from_dataframe(df, by_id_global=by_id_global)
 
         apply_rows = [
             {
@@ -1684,11 +1794,14 @@ def apply_zalo_payout_import(
     """Tru available_amount, cong received; ghi withdraw_requests status CHUA_BAO_KHACH."""
     try:
         supabase = get_supabase_client()
-        user_id_zl_main = str(current_user.get("id_zl") or "").strip()
-        if not user_id_zl_main:
-            raise HTTPException(status_code=400, detail="Tai khoan khong co id_zl")
+        user_owner = user_owner_global_zalo(current_user)
+        if not user_owner:
+            raise HTTPException(
+                status_code=400,
+                detail="Tai khoan khong co id_globalzalo (va khong co id_zl fallback)",
+            )
 
-        contacts = _all_zalo_contact_rows_for_owner(supabase, user_id_zl_main=user_id_zl_main)
+        contacts = _all_zalo_contact_rows_for_owner(supabase, user_owner_global=user_owner)
         _, by_id = _contact_maps_for_payout(contacts)
 
         seen: set[int] = set()
@@ -1731,7 +1844,7 @@ def apply_zalo_payout_import(
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        f"contact_id={it.contact_id} id_from={row.get('id_from')} "
+                        f"contact_id={it.contact_id} id_global={row.get('id_global')} "
                         f"khong du available_amount (con {avail}, can So tien chuyen {amt})"
                     ),
                 )
@@ -1742,18 +1855,18 @@ def apply_zalo_payout_import(
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        f"contact_id={it.contact_id} id_from={row.get('id_from')} "
+                        f"contact_id={it.contact_id} id_global={row.get('id_global')} "
                         f"khong du dieu kien withdraw_requests: {block}"
                     ),
                 )
             bank_fields = _withdraw_bank_fields_from_contact(row)
             assert bank_fields is not None
             bank_type, stk, bank_name = bank_fields
-            id_from = str(row.get("id_from") or "").strip()
-            if not id_from:
+            id_global = str(row.get("id_global") or "").strip()
+            if not id_global:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"contact_id={it.contact_id} thieu id_from",
+                    detail=f"contact_id={it.contact_id} thieu id_global",
                 )
 
             new_avail = round(avail - float(deduct), 4)
@@ -1779,7 +1892,7 @@ def apply_zalo_payout_import(
                 )
             withdraw_id = _insert_withdraw_request_chua_bao_khach(
                 supabase,
-                id_from=id_from,
+                id_global=id_global,
                 d_name=str(row.get("d_name") or "").strip() or None,
                 amount_vnd=amount_apply,
                 bank_type=bank_type,
@@ -1789,7 +1902,7 @@ def apply_zalo_payout_import(
             applied.append(
                 {
                     "contact_id": it.contact_id,
-                    "id_from": id_from,
+                    "id_global": str(row.get("id_global") or "").strip() or None,
                     "amount_vnd": amt,
                     "is_admin": is_admin,
                     "deduct_applied": round(float(deduct), 4),
@@ -1912,18 +2025,20 @@ def list_commission_order_splits(
             )
         result = query.order("created_at", desc=True).limit(limit).execute()
         items = result.data or []
-        id_zl_values = sorted(
+        id_g_values = sorted(
             {
-                str(row.get("id_zl") or "").strip()
+                str(row.get("id_global") or "").strip()
                 for row in items
-                if str(row.get("id_zl") or "").strip()
+                if str(row.get("id_global") or "").strip()
             }
         )
-        if id_zl_values:
-            contact_map = _build_contact_map(supabase, id_zl_values)
+        contact_map: dict[str, dict[str, str | None]] = {}
+        if id_g_values:
+            contact_map.update(_build_contact_map_by_global(supabase, id_g_values))
+        if contact_map:
             for row in items:
-                zl = str(row.get("id_zl") or "").strip()
-                info = contact_map.get(zl) if zl else None
+                k = str(row.get("id_global") or "").strip()
+                info = contact_map.get(k) if k else None
                 row["d_name"] = (info or {}).get("name")
         else:
             for row in items:
@@ -1991,7 +2106,7 @@ def _analyze_import_rows(content: bytes, filename: str) -> dict:
     supabase = get_supabase_client()
     for row in rows:
         row["source_filename"] = filename
-        row["id_zl"] = None
+        row["id_global"] = None
         row["name"] = None
         row["hh_user"] = 0
 
@@ -2005,14 +2120,14 @@ def _analyze_import_rows(content: bytes, filename: str) -> dict:
 
     try:
         convert_info_map = _build_convert_info_map(supabase, sub_id_values)
-        zl_values = sorted(
+        id_gz_values = sorted(
             {
-                str(info.get("zl") or "").strip()
+                str(info.get("id_globalzalo") or "").strip()
                 for info in convert_info_map.values()
-                if str(info.get("zl") or "").strip()
+                if str(info.get("id_globalzalo") or "").strip()
             }
         )
-        contact_map = _build_contact_map(supabase, zl_values)
+        contact_map = _build_contact_map_by_global(supabase, id_gz_values)
         h1, h2, h3, h4, hoa_hong_ok = _fetch_hoa_hong_pct_quads(supabase)
     except Exception as exc:
         raise HTTPException(
@@ -2032,9 +2147,10 @@ def _analyze_import_rows(content: bytes, filename: str) -> dict:
         if not convert_info:
             continue
         matched_convert += 1
-        zl = str(convert_info.get("zl") or "").strip()
-        group_id = str(convert_info.get("group_id") or "").strip() or None
-        contact = contact_map.get(zl)
+        id_gz = str(convert_info.get("id_globalzalo") or "").strip()
+        if not id_gz:
+            continue
+        contact = contact_map.get(id_gz)
         if not contact:
             continue
 
@@ -2044,8 +2160,9 @@ def _analyze_import_rows(content: bytes, filename: str) -> dict:
             missing_config += 1
 
         net_commission = float(row.get("net_affiliate_commission") or 0)
-        row["id_zl"] = zl
-        row["name"] = contact.get("name")
+        id_global_c = str((contact or {}).get("id_global") or "").strip() or id_gz or None
+        row["id_global"] = id_global_c
+        row["name"] = (contact or {}).get("name")
         _, _, hh_u = _amounts_from_hoa_hong_net(net_commission, h1, h2, h3, h4)
         row["hh_user"] = hh_u if hoa_hong_ok else 0.0
         matched_contact += 1
@@ -2114,8 +2231,8 @@ def _build_import_preview_items(
     hoa_hong: dict | None = None,
 ) -> list[dict]:
     out: list[dict] = []
-    group_cache: dict[str, tuple[str | None, str | None]] = {}
-    agency_ids_for_lookup: set[str] = set()
+    group_cache: dict[str, tuple[str | None, str | None, str | None]] = {}
+    agency_globals_for_lookup: set[str] = set()
     hh = hoa_hong or {}
     v1 = float(hh.get("value_1") or 0)
     v2 = float(hh.get("value_2") or 0)
@@ -2125,25 +2242,32 @@ def _build_import_preview_items(
     for row in rows_to_upsert:
         sub_id1 = str(row.get("sub_id1") or "").strip()
         convert_info = convert_info_map.get(sub_id1) if sub_id1 else None
-        group_id = str((convert_info or {}).get("group_id") or "").strip() or None
+        id_globalgroup = str((convert_info or {}).get("id_globalgroup") or "").strip() or None
 
-        agency_id_zl = None
-        owner_id_zl_main = None
+        agency_id_global = None
+        owner_id_global_main = None
+        group_id_global = None
         split_issue = None
         if not sub_id1:
             split_issue = "thieu_sub_id1"
         elif not convert_info:
             split_issue = "thieu_convert_results"
-        elif not group_id:
-            split_issue = "thieu_group_id"
+        elif not str((convert_info or {}).get("id_globalzalo") or "").strip():
+            split_issue = "thieu_id_globalzalo"
+        elif not id_globalgroup:
+            split_issue = "thieu_id_globalgroup"
         else:
-            if group_id not in group_cache:
-                group_cache[group_id] = _fetch_group_owner_and_agency_id_zl(supabase, group_id)
-            agency_id_zl, owner_id_zl_main = group_cache[group_id]
-            if not owner_id_zl_main:
-                split_issue = "thieu_id_zl_main"
-        if agency_id_zl:
-            agency_ids_for_lookup.add(agency_id_zl)
+            if id_globalgroup not in group_cache:
+                group_cache[id_globalgroup] = _fetch_group_globals_for_import(
+                    supabase, id_globalgroup
+                )
+            group_id_global, agency_id_global, owner_id_global_main = group_cache[id_globalgroup]
+            if not owner_id_global_main:
+                split_issue = "thieu_id_global_main"
+            elif not agency_id_global:
+                split_issue = "thieu_id_globalzalo_nhom"
+        if agency_id_global:
+            agency_globals_for_lookup.add(agency_id_global)
 
         net = float(row.get("net_affiliate_commission") or 0)
         oid = str(row.get("order_id") or "").strip()
@@ -2162,24 +2286,26 @@ def _build_import_preview_items(
                 "order_status_transition": row.get("order_status_transition"),
                 "is_unchanged": is_unchanged,
                 "net_affiliate_commission": net,
-                "id_zl": row.get("id_zl"),
+                "id_global": row.get("id_global"),
                 "name": row.get("name"),
                 "hh_user": row.get("hh_user"),
-                "group_id": group_id,
-                "agency_id_zl": agency_id_zl,
+                "id_globalgroup": id_globalgroup,
+                "group_id_global": group_id_global or id_globalgroup,
+                "agency_id_global": agency_id_global,
                 "agency_name": None,
-                "owner_id_zl_main": owner_id_zl_main,
+                "owner_id_global_main": owner_id_global_main,
                 "agency_amount": agency_amount,
                 "owner_amount": owner_amount,
                 "split_issue": split_issue,
             }
         )
-    if agency_ids_for_lookup:
-        agency_contact_map = _build_contact_map(supabase, sorted(agency_ids_for_lookup))
+    if agency_globals_for_lookup:
+        agency_contact_map = _build_contact_map_by_global(
+            supabase, sorted(agency_globals_for_lookup)
+        )
         for item in out:
-            zid = str(item.get("agency_id_zl") or "").strip()
-            if zid:
-                item["agency_name"] = (agency_contact_map.get(zid) or {}).get("name")
+            ag = str(item.get("agency_id_global") or "").strip()
+            item["agency_name"] = (agency_contact_map.get(ag) or {}).get("name") if ag else None
     out.sort(key=_preview_item_sort_key)
     return out
 
@@ -2262,7 +2388,7 @@ async def sync_hh_to_zalo_bill_apply(file: UploadFile = File(...)):
     if eligible_n == 0:
         raise HTTPException(
             status_code=400,
-            detail="Khong co don nao du dieu kien dong bo (DB Hoan thanh + id_zl + zalo_contacts)",
+            detail="Khong co don nao du dieu kien dong bo (DB Hoan thanh + id_global + zalo_contacts)",
         )
 
     try:
@@ -2372,8 +2498,9 @@ async def import_commission_report_preview(file: UploadFile = File(...)):
         "lookup": {
             "sub_id1_count": len(analyzed["sub_id_values"]),
             "matched_convert_results": analyzed["matched_convert"],
-            "missing_convert_results": len(analyzed["sub_id_values"])
-            - len(analyzed["convert_info_map"]),
+            "missing_convert_results": sum(
+                1 for s in analyzed["sub_id_values"] if s not in analyzed["convert_info_map"]
+            ),
             "matched_zalo_contacts": analyzed["matched_contact"],
             "missing_zalo_contacts": max(
                 analyzed["matched_convert"] - analyzed["matched_contact"], 0
@@ -2460,7 +2587,9 @@ async def import_commission_report(file: UploadFile = File(...)):
             "lookup": {
                 "sub_id1_count": len(sub_id_values),
                 "matched_convert_results": matched_convert,
-                "missing_convert_results": len(sub_id_values) - len(convert_info_map),
+                "missing_convert_results": sum(
+                    1 for s in sub_id_values if s not in convert_info_map
+                ),
                 "matched_zalo_contacts": matched_contact,
                 "missing_zalo_contacts": max(matched_convert - matched_contact, 0),
                 "matched_commission_config": matched_config,
@@ -2472,7 +2601,7 @@ async def import_commission_report(file: UploadFile = File(...)):
     import_batch_id = str(uuid.uuid4())
     upserted = 0
     for start in range(0, len(rows), UPSERT_CHUNK):
-        chunk = rows[start : start + UPSERT_CHUNK]
+        chunk = [_strip_legacy_import_order_fields(r) for r in rows[start : start + UPSERT_CHUNK]]
         try:
             supabase.table("affiliate_commission_orders").upsert(
                 chunk,
@@ -2527,7 +2656,9 @@ async def import_commission_report(file: UploadFile = File(...)):
         "lookup": {
             "sub_id1_count": len(sub_id_values),
             "matched_convert_results": matched_convert,
-            "missing_convert_results": len(sub_id_values) - len(convert_info_map),
+            "missing_convert_results": sum(
+                1 for s in sub_id_values if s not in convert_info_map
+            ),
             "matched_zalo_contacts": matched_contact,
             "missing_zalo_contacts": max(matched_convert - matched_contact, 0),
             "matched_commission_config": matched_config,

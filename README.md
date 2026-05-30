@@ -72,7 +72,7 @@ Health check endpoint.
 
 ### `POST /commission-report/import`
 
-Upload file báo cáo hoa hồng Shopee (`.csv`, `.xlsx`, `.xls`), **gộp theo `ID đơn hàng`**, rồi **upsert** vào bảng `public.affiliate_commission_orders`. Sau đó **đồng bộ phân tầng** vào `public.affiliate_commission_order_splits` (migration **`006`**, **`008`** tắt RLS nếu cần): mỗi đơn có dòng **chủ tool** (`id_zl_main` từ `zalo_groups` theo `group_id`) **25%** `net_affiliate_commission` và dòng **đại lý** **15%** khi tra được `sub_id1` → `convert_results.group` → `zalo_groups.group_id` → `id_zl` đại lý. Đơn **Đã hủy** (trạng thái chứa “hủy”): cập nhật `order_status` trên split và đặt `amount = 0`, `net_affiliate_commission_at_split = 0`. Đơn trong DB đã **`order_status = "Đã cộng tiền"`**: **không làm gì** (không update `order_placed_at` / `source_filename`, không upsert) — đếm trong `skipped_already_paid`.
+Upload file báo cáo hoa hồng Shopee (`.csv`, `.xlsx`, `.xls`), **gộp theo `ID đơn hàng`**, rồi **upsert** vào `public.affiliate_commission_orders`. Sau đó **đồng bộ phân tầng** vào `public.affiliate_commission_order_splits` (migration **`006`**, **`008`**, **`027`**): mỗi đơn có dòng **chủ tool** và dòng **đại lý** (nếu có) theo `%` `hoa_hong` trong `app_config_kv`. Tra cứu **chỉ field global**: `sub_id1` = `convert_results.id_zl` → `id_globalgroup` → `zalo_groups.id_global`; đơn: `convert_results.id_globalzalo` → `affiliate_commission_orders.id_global` (user affiliate); split **agency**: `zalo_groups.id_globalzalo` (đại lý); split **platform_owner**: `zalo_groups.id_global_main` (chủ tool). Đơn lưu **`id_global`** (không `id_zl`); splits lưu **`id_global`** người nhận. Đơn **Đã hủy**: cập nhật split, `amount = 0`. Đơn **`Đã cộng tiền`**: bỏ qua (`skipped_already_paid`). Bill Conversion / RPC đồng bộ theo `id_global`.
 
 Đơn đã có trong DB mà **`order_status` từ file trùng `order_status` trong DB** — coi là **không đổi trạng thái** → **bỏ qua upsert và không đồng bộ splits** (không so các field khác như tiền, thời gian đặt, `sub_id1`…; không so `source_filename`). Đơn **mới** hoặc **đổi trạng thái** so với DB → upsert như bình thường. Response có `skipped_unchanged`.
 
@@ -82,22 +82,24 @@ Response thêm: `skipped_already_paid`, `import_batch_id` (uuid mỗi lần impo
 
 Nhận cùng file như endpoint import nhưng **không ghi DB**. Trả `would_upsert`, `would_skip_unchanged`, `skipped_already_paid` (số đơn trong file đã là **Đã cộng tiền** trong DB — **không** ghi DB), `preview_counts` (tổng / lỗi split / Đã hủy / đổi trạng thái), và `preview_items` (mọi đơn trong nhóm upsert từ file — **sắp xếp ưu tiên**: lỗi split → Đã hủy → đổi trạng thái → sẽ cập nhật → không đổi). Trường `is_unchanged`: **chỉ** khi `order_status` file trùng DB.
 
+Mỗi phần tử `preview_items` gồm (tối thiểu): `order_id`, `order_status`, `net_affiliate_commission`, **`id_global`**, `name`, `hh_user`, **`id_globalgroup`**, **`group_id_global`**, **`agency_id_global`**, `agency_name`, `agency_amount`, **`owner_id_global_main`**, `owner_amount`, `split_issue` (`thieu_convert_results`, `thieu_id_globalzalo`, `thieu_id_globalgroup`, `thieu_id_global_main`, `thieu_id_globalzalo_nhom`), `order_status_transition`, `is_unchanged`. `lookup.missing_convert_results` = số `sub_id1` không có `convert_results.id_zl`.
+
 ### `POST /commission-report/sync-hh-to-zalo`
 
 Gọi RPC `sync_commission_hh_to_zalo()` **không tham số** (mặc định `p_restrict_order_ids = NULL`): đồng bộ **tất cả** đơn `order_status = 'Hoàn thành'` đủ điều kiện (giữ hành vi cũ / nâng cao).
 
 ### `POST /commission-report/sync-hh-to-zalo-bill-preview`
 
-Upload **Bill Conversion** Shopee (`.csv` / `.xlsx` / `.xls`). Parser: cột `ID đơn hàng`, `Trạng thái đặt hàng`; chỉ lấy các dòng **`Trạng thái đặt hàng = Hoàn thành`**, `order_id` unique. **Không ghi DB**. Trả `preview_items` (đối chiếu DB: có đơn, trạng thái, `id_zl`, có `zalo_contacts`, `eligible`, `skip_reason`, `hh_user`, `splits_total`) và các số đếm.
+Upload **Bill Conversion** Shopee (`.csv` / `.xlsx` / `.xls`). Parser: cột `ID đơn hàng`, `Trạng thái đặt hàng`; chỉ lấy các dòng **`Trạng thái đặt hàng = Hoàn thành`**, `order_id` unique. **Không ghi DB**. Trả `preview_items` (đối chiếu DB: có đơn, trạng thái, `id_global`, có `zalo_contacts`, `eligible`, `skip_reason`, `hh_user`, `splits_total`) và các số đếm.
 
 ### `POST /commission-report/sync-hh-to-zalo-bill-apply`
 
-Cùng định dạng file; parse lại `order_id` rồi gọi RPC `sync_commission_hh_to_zalo(p_restrict_order_ids => …)` — chỉ đơn nằm trong danh sách **và** đủ điều kiện như RPC (DB `Hoàn thành`, có `id_zl`, có contact). Trả payload RPC + `source_filename`, `restrict_order_count`, `preview_eligible_count`.
+Cùng định dạng file; parse lại `order_id` rồi gọi RPC `sync_commission_hh_to_zalo(p_restrict_order_ids => …)` — chỉ đơn nằm trong danh sách **và** đủ điều kiện như RPC (DB `Hoàn thành`, có `id_global`, có contact theo `zalo_contacts.id_global`). Trả payload RPC + `source_filename`, `restrict_order_count`, `preview_eligible_count`.
 
-Chi tiết RPC (cộng `hh_user` + splits, ghi log, chỉ `UPDATE` trạng thái đơn thuộc tập **eligible** — xem migration **`007`** và **`018_sync_commission_hh_to_zalo_order_filter.sql`**):
+Chi tiết RPC (cộng `hh_user` + splits, ghi log, chỉ `UPDATE` trạng thái đơn thuộc tập **eligible** — xem migration **`029_sync_commission_hh_to_zalo_global.sql`**):
 
-- **`SUM(hh_user)`** trên các đơn eligible (affiliate);
-- **cộng thêm** **`SUM(amount)`** từ `affiliate_commission_order_splits` gắn các đơn đó, **theo từng `id_zl` người nhận split**, chỉ khi `id_zl` đó cũng tồn tại trong `zalo_contacts`.
+- **`SUM(hh_user)`** trên các đơn eligible (affiliate theo `id_global`);
+- **cộng thêm** **`SUM(amount)`** từ `affiliate_commission_order_splits` gắn các đơn đó, **theo từng `id_global` người nhận split**, chỉ khi `id_global` đó tồn tại trong `zalo_contacts`.
 
 Sau đó đổi `order_status` thành **`Đã cộng tiền`** (chỉ các đơn trong tập eligible), ghi `public.commission_payout_sync_log`. Response: `sync_batch_id`, `orders_updated`, `orders_skipped_no_contact`, `contacts[]`, `total_amount_added`.
 
@@ -114,7 +116,7 @@ Cần migration **`003`**, **`004`**, **`005`**, **`006`**, **`007`**, **`018`**
 
 ### `GET /commission-report/order-splits?limit=500&placed_within_days=7`
 
-Đọc `public.affiliate_commission_order_splits`, sắp xếp `created_at` giảm dần. Mỗi dòng được bổ sung **`d_name`** từ `zalo_contacts.d_name` theo `id_zl` = `id_from` (nếu không có contact thì `d_name` null).
+Đọc `public.affiliate_commission_order_splits`, sắp xếp `created_at` giảm dần. Mỗi dòng được bổ sung **`d_name`** từ `zalo_contacts` theo **`id_global`** trên split (nếu không có contact thì `d_name` null).
 
 **Query params**
 
@@ -124,7 +126,7 @@ Cần migration **`003`**, **`004`**, **`005`**, **`006`**, **`007`**, **`018`**
 
 ### `GET /zalo-groups?limit=500`
 
-Đọc `public.zalo_groups` (chỉ bản ghi **`deleted_at` null**), sắp xếp `updated_at` giảm dần.
+Đọc `public.zalo_groups` (chỉ bản ghi **`deleted_at` null**), lọc theo **`id_global_main`** của user đăng nhập (`auth_users.id_globalzalo`, fallback `id_zl`), sắp xếp `updated_at` giảm dần.
 
 **Query params**
 
@@ -211,10 +213,11 @@ Xóa cứng theo `id`. Migration: **`021_bot_group.sql`** + **`022_bot_group_max
 - `order_status_transition`: nếu đơn đã tồn tại và `order_status` trong DB **khác** trạng thái từ file thì ghi `"cũ -> mới"`; nếu **không đổi** thì `NULL` (xóa chuỗi cũ).
 - Đơn đã có trong DB với `order_status = "Đã cộng tiền"`: **không ghi DB** (không upsert, không update). Response đếm trong `skipped_already_paid`.
 - `order_placed_at`: **mốc sớm nhất** trong các dòng cùng đơn. Cột thời gian trong file Shopee là **M/D/YYYY** (tháng trước, ngày sau), giờ 24h, coi là **giờ wall Việt Nam** (`Asia/Ho_Chi_Minh`); parse ưu tiên `dayfirst=False`, dòng không parse được thì thử `dayfirst=True`; sau đó chuyển **UTC** rồi lưu `timestamptz`.
-- Enrich khi import:
-  - dùng `sub_id1` tra `convert_results.id_zl` để lấy `zl`,
-  - dùng `zl` tra `zalo_contacts` để lấy `id_from`, `name`,
-  - lưu `id_from` vào `affiliate_commission_orders.id_zl` và `name` vào `affiliate_commission_orders.name`.
+- Enrich khi import (**chỉ field global**; Bill Conversion / RPC chưa đổi):
+  - `sub_id1` trên file = **`convert_results.id_zl`**; từ dòng convert lấy **`id_globalzalo`**, **`id_globalgroup`** (backfill: `fe_bot_aff/scripts/fill-convert-results-global-ids.js`).
+  - User đơn: **`convert_results.id_globalzalo`** → `zalo_contacts` → `affiliate_commission_orders.id_global`, `name`, `hh_user`.
+  - Split **agency** `id_global` = **`zalo_groups.id_globalzalo`** (theo `id_globalgroup`); split **owner** `id_global` = **`id_global_main`**.
+  - Upsert ghi **`id_zl = null`** trên đơn/splits; **`group_id`** split = `id_global` nhóm; migration **`027`**.
   - `hh_user` và số tiền split agency/owner: đọc một dòng `app_config_kv` với `config_key = hoa_hong`, `is_active = true`; `value_1`…`value_4` là phần trăm 0–100 (parse từ text). Công thức trên `net_affiliate_commission` (làm tròn 4 chữ số): `net * (100 - value_4) * value_k / 10000` với `value_3` → user (`hh_user`), `value_1` → agency, `value_2` → owner. Không có dòng active → `hh_user` và split amounts = 0; `lookup.matched_commission_config` / `missing_commission_config` đếm theo từng dòng có `zalo_contacts`.
 
 **Response mẫu**
@@ -229,8 +232,26 @@ Xóa cứng theo `id`. Migration: **`021_bot_group.sql`** + **`022_bot_group_max
     "matched_convert_results": 115,
     "missing_convert_results": 5,
     "matched_zalo_contacts": 109,
-    "missing_zalo_contacts": 6
+    "missing_zalo_contacts": 6,
+    "matched_commission_config": 109,
+    "missing_commission_config": 0,
+    "hoa_hong": { "ok": true, "value_1": 15, "value_2": 25, "value_3": 60, "value_4": 0 }
   }
+}
+```
+
+**`import-preview` — ví dụ một phần tử `preview_items`**
+
+```json
+{
+  "order_id": "260422FDNE5GDN",
+  "order_status": "Hoàn thành",
+  "id_global": "global_zalo_id",
+  "id_globalgroup": "global_group_id",
+  "group_id_global": "global_group_id",
+  "agency_id_global": "agency_global",
+  "owner_id_global_main": "owner_global",
+  "split_issue": null
 }
 ```
 
@@ -245,7 +266,10 @@ Chạy migration SQL một lần trong Supabase SQL Editor:
 - `supabase/migrations/005_commission_payout_sync_log_rls_fix.sql` (nếu lỗi RLS khi gọi RPC — `SECURITY DEFINER` + tắt RLS bảng log)
 - `supabase/migrations/006_affiliate_commission_order_splits.sql` (bảng `affiliate_commission_order_splits` — phân tầng sau import)
 - `supabase/migrations/007_sync_commission_hh_to_zalo_splits.sql` (RPC đồng bộ: `hh_user` + splits)
-- `supabase/migrations/018_sync_commission_hh_to_zalo_order_filter.sql` (RPC thêm `p_restrict_order_ids` — đồng bộ theo danh sách `order_id` từ file Bill Conversion)
+- `supabase/migrations/029_sync_commission_hh_to_zalo_global.sql` (RPC Bill/Sync HH dùng `id_global`, vẫn hỗ trợ `p_restrict_order_ids`)
+- `supabase/migrations/026_commission_global_columns.sql`, `028_zalo_groups_id_globalzalo.sql` (cột global: `auth_users.id_globalzalo`, `convert_results.id_globalzalo` / `id_globalgroup`, `affiliate_commission_orders.id_global`, `affiliate_commission_order_splits.id_global`, `zalo_groups.id_global` / `id_global_main` / `id_globalzalo`, `zalo_contacts.id_global` / `id_global_gr` — `IF NOT EXISTS`)
+- `supabase/migrations/027_import_global_only_splits.sql` (import: `splits.id_zl` nullable; splits chỉ bắt buộc `id_global` trong logic app)
+- `supabase/migrations/030_withdraw_requests_global_only.sql` (withdraw_requests: chuẩn hóa `id_global`, unique pending theo `id_global`, index cột global)
 - `supabase/migrations/008_affiliate_commission_order_splits_rls_fix.sql` (tắt RLS bảng splits nếu Supabase chặn insert/select)
 - `supabase/migrations/009_zalo_groups_status.sql` (cột `status` cho nhóm — nếu chưa có)
 - `supabase/migrations/010_zalo_groups_rls_disable.sql` (tắt RLS `zalo_groups` nếu cần)
@@ -280,7 +304,9 @@ api_bot_aff/
 │     ├─ 014_zalo_contacts_id_group_groups_id_zl_main.sql
 │     ├─ 015_commission_split_config.sql
 │     ├─ 016_app_config_kv.sql
-│     └─ 017_app_config_kv_labels.sql
+│     ├─ 017_app_config_kv_labels.sql
+│     ├─ 026_commission_global_columns.sql
+│     └─ 027_import_global_only_splits.sql
 ├─ requirements.txt
 └─ README.md
 ```
@@ -290,3 +316,5 @@ api_bot_aff/
 - Không commit file `.env` lên git.
 - Nếu API trả lỗi `500`, kiểm tra lại `SUPABASE_URL`, `SUPABASE_KEY` và quyền truy cập bảng `convert_results`.
 - Import / đọc bảng `affiliate_commission_orders` và ghi `affiliate_commission_order_splits` cần quyền Supabase phù hợp (ghi + đọc). Thường dùng **service role** trên server nếu bật RLS; không đưa service role lên frontend.
+- Cột global (`026_commission_global_columns.sql`): sau khi chạy migration, có thể backfill `convert_results.id_globalzalo` / `id_globalgroup` bằng script trong repo FE (`fe_bot_aff/scripts/fill-convert-results-global-ids.js`, xem `README-fill-convert-global.md`).
+- JWT access token có thể chứa claim **`id_globalzalo`** (khi user có giá trị); `GET/PATCH /auth/me` trả **`id_globalzalo`** cho client.
