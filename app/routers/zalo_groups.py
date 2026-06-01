@@ -12,9 +12,34 @@ router = APIRouter(prefix="/zalo-groups", tags=["zalo-groups"])
 ZaloGroupStatus = Literal["ACTIVE", "INACTIVE", "PENDING"]
 
 
+def _blank_to_none(v: str | None) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def _assert_aff_id_in_registry(supabase, aff_id: str | None) -> None:
+    if aff_id is None:
+        return
+    result = (
+        supabase.table("aff_bot")
+        .select("id")
+        .eq("id_aff", aff_id)
+        .limit(1)
+        .execute()
+    )
+    if not (result.data or []):
+        raise HTTPException(
+            status_code=422,
+            detail=f"aff_id={aff_id!r} khong ton tai trong aff_bot",
+        )
+
+
 class ZaloGroupUpdate(BaseModel):
     group_name: str = Field(..., min_length=1, max_length=500)
     status: ZaloGroupStatus
+    aff_id: str | None = Field(default=None, max_length=2000)
 
 
 @router.get("")
@@ -46,17 +71,20 @@ def list_zalo_groups(
 
 @router.patch("/{group_row_id}")
 def update_zalo_group(group_row_id: int, payload: ZaloGroupUpdate):
-    """Cap nhat group_name va status theo id (primary key)."""
+    """Cap nhat group_name, status va aff_id theo id (primary key)."""
     name = payload.group_name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="group_name khong duoc rong")
+    aff_id = _blank_to_none(payload.aff_id)
     row = {
         "group_name": name,
         "status": payload.status,
+        "aff_id": aff_id,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
         supabase = get_supabase_client()
+        _assert_aff_id_in_registry(supabase, aff_id)
         result = (
             supabase.table("zalo_groups")
             .update(row)

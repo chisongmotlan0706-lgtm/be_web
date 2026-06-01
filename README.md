@@ -186,21 +186,33 @@ Cập nhật theo `id`.
 
 Xóa cứng theo `id`.
 
-### `GET /bot-group?limit=200`
+### `GET /bot-registry?limit=200`
 
-Đọc `public.bot_group`, sắp xếp `priority` tăng dần rồi `id` (gồm `max_rep`, `current_rep` nếu đã migration **`022`**).
+Đọc `public.bot_registry`, sắp xếp `sort_order` tăng dần rồi `id_bot`. Mỗi dòng có thêm `consecutive_used` từ `reply_router_state` (scope `global`) — chỉ bot trùng `current_bot_id` mới có giá trị > 0; và `linked_groups` từ `bot_datagroup` → `zalo_groups` (`group_name`, `id_globalzalo`) → `zalo_contacts.d_name` (theo `id_globalgroup` = `zalo_groups.id_global`, contact theo `id_globalzalo` = `zalo_contacts.id_global`). Migration map: **`035_bot_datagroup.sql`**.
 
-### `POST /bot-group`
+### `PUT /bot-registry/{id_bot}`
 
-Tạo dòng: JSON `name_bot` (nullable), `type_bot` (`REP` | `GHI`), `priority` (1–100), `max_rep` (optional, bigint hoặc null). **`id_bot` do server sinh** — chuỗi số ngẫu nhiên đúng **16 ký tự**; `current_rep` = `null` khi tạo.
+Cập nhật `display_name`, `max_consecutive_replies` (> 0), `sort_order` (≥ 0, **duy nhất**), `is_enabled` — **không** cập nhật `id_bot`, `consecutive_used`. Migration: **`031_bot_registry.sql`** + **`032_bot_registry_sort_order_unique.sql`**.
 
-### `PUT /bot-group/{id}`
+### `POST /bot-registry`
 
-Cập nhật `name_bot`, `type_bot`, `priority`, `max_rep` — **không** cập nhật `id_bot` hay `current_rep`.
+Thêm nhiều bot: JSON `{ "id_bots": ["...", "..."] }` — tự gán `sort_order` tăng dần từ max+1, `max_consecutive_replies=5`, `is_enabled=true`. Bỏ qua `id_bot` đã tồn tại; trả `created_count`, `skipped_id_bots`, `items`.
 
-### `DELETE /bot-group/{id}`
+### `GET /aff-bot?limit=200&search=...`
 
-Xóa cứng theo `id`. Migration: **`021_bot_group.sql`** + **`022_bot_group_max_rep_current_rep.sql`** (cột `max_rep`, `current_rep`).
+Đọc `public.aff_bot`, sắp xếp `id` giảm dần. `search` lọc `id_aff` (ilike).
+
+### `POST /aff-bot`
+
+Tạo dòng: JSON `id_aff` (nullable).
+
+### `PUT /aff-bot/{id}`
+
+Cập nhật `id_aff`.
+
+### `DELETE /aff-bot/{id}`
+
+Xóa cứng theo `id`. Migration: **`033_aff_bot.sql`**.
 
 **Form-data**
 
