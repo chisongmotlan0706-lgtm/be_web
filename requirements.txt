@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+supabase
+pydantic-settings
+pandas
+openpyxl
+python-multipart
+pyjwt
+bcrypt
