@@ -1194,7 +1194,7 @@ def _enriched_zalo_contacts_for_owner(
 
 
 def _zalo_contacts_transfer_workbook(items: list[dict], *, noi_dung_template: str) -> BytesIO:
-    """Export CK: cot ngan hang = zalo_contacts.bank_type (khong dung bank_name)."""
+    """Export CK: Ten nguoi huong = bank_name; cot bank_type = zalo_contacts.bank_type."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Chuyen tien"
@@ -1220,7 +1220,7 @@ def _zalo_contacts_transfer_workbook(items: list[dict], *, noi_dung_template: st
     for idx, item in enumerate(items, start=1):
         id_g = str(item.get("id_global") or "").strip()
         id_gr = str(item.get("id_global_gr") or "").strip()
-        d_name = str(item.get("d_name") or "").strip()
+        bank_name = str(item.get("bank_name") or "").strip()
         bank = str(item.get("bank_type") or "").strip()
         stk_raw = str(item.get("stk") or "").strip()
         amt = _floor_vnd_to_thousand(float(item.get("available_amount") or 0))
@@ -1235,7 +1235,7 @@ def _zalo_contacts_transfer_workbook(items: list[dict], *, noi_dung_template: st
         ws.cell(row=row_num, column=4, value=amt)
         c_stk = ws.cell(row=row_num, column=5, value=stk_raw if stk_raw else "")
         c_stk.number_format = "@"
-        ws.cell(row=row_num, column=6, value=d_name if d_name else id_g)
+        ws.cell(row=row_num, column=6, value=bank_name if bank_name else id_g)
         ws.cell(row=row_num, column=7, value=bank)
         ws.cell(row=row_num, column=8, value=noi)
         ws.cell(row=row_num, column=9, value="")
@@ -1496,6 +1496,8 @@ def _insert_withdraw_request_chua_bao_khach(
         raise HTTPException(status_code=400, detail="amount withdraw_requests phai > 0")
     payload = {
         "id_global": id_global,
+        # id_from van NOT NULL tren DB chua chay migration 030; ghi cung ma global.
+        "id_from": id_global,
         "d_name": d_name,
         "amount": amount_vnd,
         "bank_type": bank_type,
