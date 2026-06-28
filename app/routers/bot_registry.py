@@ -38,6 +38,44 @@ def _fetch_router_state(supabase) -> tuple[str | None, int]:
     return (str(current_bot_id) if current_bot_id is not None else None), consecutive_used
 
 
+def _ensure_reply_router_state(supabase) -> None:
+    """Seed reply_router_state (scope global) neu chua co — bot enabled dau tien theo sort_order."""
+    current_bot_id, _ = _fetch_router_state(supabase)
+    if current_bot_id is not None:
+        return
+
+    result = (
+        supabase.table("bot_registry")
+        .select("id_bot")
+        .eq("is_enabled", True)
+        .order("sort_order", desc=False)
+        .order("id_bot", desc=False)
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        return
+
+    first_bot_id = str(rows[0].get("id_bot") or "").strip()
+    if not first_bot_id:
+        return
+
+    try:
+        supabase.table("reply_router_state").insert(
+            {
+                "scope_key": _ROUTER_SCOPE,
+                "current_bot_id": first_bot_id,
+                "consecutive_used": 0,
+            }
+        ).execute()
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "duplicate" in msg or "unique" in msg:
+            return
+        raise
+
+
 def _enrich_linked_groups(supabase, items: list[dict]) -> None:
     if not items:
         return
@@ -243,6 +281,7 @@ def bulk_create_bot_registry(payload: BotRegistryBulkCreate):
             for i, bid in enumerate(to_create)
         ]
         insert_result = supabase.table("bot_registry").insert(rows).execute()
+        _ensure_reply_router_state(supabase)
         created_raw = insert_result.data or []
         created = _enrich_items(created_raw)
         return {
@@ -264,6 +303,7 @@ def bulk_create_bot_registry(payload: BotRegistryBulkCreate):
 def list_bot_registry(limit: int = Query(default=200, ge=1, le=1000)):
     try:
         supabase = get_supabase_client()
+        _ensure_reply_router_state(supabase)
         result = (
             supabase.table("bot_registry")
             .select(_SELECT_FIELDS)
@@ -291,6 +331,7 @@ def update_bot_registry(id_bot: str, payload: BotRegistryUpdate):
         updated = (result.data or [None])[0]
         if updated is None:
             raise HTTPException(status_code=404, detail=f"bot_registry id_bot={key} not found")
+        _ensure_reply_router_state(supabase)
         enriched = _enrich_items([updated])[0]
         return {"item": enriched}
     except HTTPException:

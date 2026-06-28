@@ -3,6 +3,7 @@ from fastapi import Depends, FastAPI
 from app.auth import get_current_user
 from app.routers.commission_config import router as commission_config_router
 from app.routers.commission_import import router as commission_import_router
+from app.routers.withdraw_requests_duplicate import router as withdraw_requests_duplicate_router
 from app.routers.commission_split_config import router as commission_split_config_router
 from app.routers.app_config_kv import router as app_config_kv_router
 from app.routers.auth import router as auth_router
@@ -20,6 +21,7 @@ def health_check():
 
 app.include_router(auth_router)
 app.include_router(commission_import_router, dependencies=[Depends(get_current_user)])
+app.include_router(withdraw_requests_duplicate_router, dependencies=[Depends(get_current_user)])
 app.include_router(commission_config_router, dependencies=[Depends(get_current_user)])
 app.include_router(commission_split_config_router, dependencies=[Depends(get_current_user)])
 app.include_router(app_config_kv_router, dependencies=[Depends(get_current_user)])
